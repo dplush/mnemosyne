@@ -222,6 +222,13 @@ def _ensure_hygiene_log_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _quote_identifier(identifier: str) -> str:
+    """Return a safely quoted SQLite identifier or raise ValueError."""
+    if not identifier or identifier[0].isdigit() or not all(c.isalnum() or c == "_" for c in identifier):
+        raise ValueError(f"Invalid table identifier: {identifier}")
+    return f'"{identifier}"'
+
+
 def _scan_table(
     conn: sqlite3.Connection,
     table_name: str,
@@ -232,13 +239,14 @@ def _scan_table(
 ) -> List[Dict[str, Any]]:
     """Scan a table for noise candidates. Returns rows as dicts."""
     cursor = conn.cursor()
+    quoted_table = _quote_identifier(table_name)
     # We deliberately select all columns we need; the schemas for
     # working_memory, memories, and episodic_memory all share the core
     # (id, content, source, timestamp, session_id, importance, metadata_json)
     # shape, with episodic_memory having extra columns we don't need.
     base_query = (
         f"SELECT id, content, source, timestamp, session_id, importance, metadata_json "
-        f"FROM {table_name}"
+        f"FROM {quoted_table}"
     )
     if after is None:
         cursor.execute(
@@ -355,6 +363,7 @@ def audit_noise(
 
     try:
         for table in tables:
+            _quote_identifier(table)
             if not _table_exists(conn, table):
                 logger.debug("Table %s does not exist, skipping", table)
                 table_counts[table] = 0
@@ -367,7 +376,8 @@ def audit_noise(
 
                 for row in rows:
                     content = row.get("content", "") or ""
-                    importance = row.get("importance", 0.5) or 0.5
+                    importance_raw = row.get("importance")
+                    importance = 0.5 if importance_raw is None else importance_raw
                     source = row.get("source", "") or ""
 
                     score, reasons = _score_noise(content, importance, source)

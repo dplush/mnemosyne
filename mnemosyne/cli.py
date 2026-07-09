@@ -759,8 +759,10 @@ def cmd_hygiene(args):
             elif rest[i] == "--json":
                 as_json = True
                 i += 1
+            elif rest[i] in ("--limit", "--offset", "--batch-size", "--min-score"):
+                _fail(f"{rest[i]} requires a value")
             else:
-                i += 1
+                _fail(f"Unknown hygiene audit option: {rest[i]}")
 
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
@@ -809,8 +811,10 @@ def cmd_hygiene(args):
             elif rest[i] == "--limit" and i + 1 < len(rest):
                 limit = _parse_int(rest[i + 1], "limit")
                 i += 2
+            elif rest[i] == "--limit":
+                _fail("--limit requires a value")
             else:
-                i += 1
+                _fail(f"Unknown hygiene status option: {rest[i]}")
         db_path = Path(DATA_DIR) / "mnemosyne.db"
         if not db_path.exists():
             _fail(f"Database not found at {db_path}")
