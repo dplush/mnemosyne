@@ -23,6 +23,7 @@ Usage:
 --scales: comma-separated (default 100K,500K,1M,10M)
 --mode: retrieval|end_to_end (default end_to_end)
 --judge-model: LLM model for judging (default same as answer model)
+--evidence-pack: opt into primary recall plus bounded supplemental evidence
 --resume: skip already-evaluated questions from results file
 """
 
@@ -39,6 +40,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -52,7 +54,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import urllib.request
 import urllib.error
-import numpy as np
 
 from mnemosyne.core.beam import BeamMemory, init_beam, _embeddings, _vec_available, _vec_insert, _fts_search_working, _generate_id
 
@@ -77,6 +78,8 @@ CONSOLIDATION_MODEL = "deepseek/deepseek-v4-flash"  # Cheap model for LLM-based 
 FALLBACK_MODELS = []  # Disabled -- fallback cascade burned $30 in credits
 DEFAULT_TOP_K = 10  # Memories to retrieve per question
 MAX_MEMORY_CONTEXT_CHARS = 8000  # Max chars of retrieved context to send to LLM
+EVIDENCE_PACK_CANDIDATE_MULTIPLIER = 2
+EVIDENCE_PACK_MAX_ITEMS = 5
 
 
 # C31: env-var truthy parser. Accepts standard truthy values
@@ -869,7 +872,9 @@ RECENT_CONTEXT_COUNT = 12  # Last N messages to include as recent context
 MAX_MEMORY_CONTEXT_CHARS = 16000  # More context for LLM to find contradictions
 
 
-def _recall_safe(beam: BeamMemory, query: str, top_k: int, temporal_weight: float = 0.0) -> list:
+def _recall_safe(beam: BeamMemory, query: str, top_k: int, temporal_weight: float = 0.0,
+                 evidence_pack: bool = False, candidate_k: int = 0,
+                 pack_k: int = 0) -> list | dict:
     """Safe recall wrapper with timeout + fresh connection isolation.
     Prevents indefinite hangs and thread-contention on shared connections."""
     import threading
@@ -896,7 +901,16 @@ def _recall_safe(beam: BeamMemory, query: str, top_k: int, temporal_weight: floa
                 fresh_conn.execute("PRAGMA journal_mode=WAL")
                 fresh_conn.execute("PRAGMA busy_timeout=120000")
                 beam.conn = fresh_conn
-            result = beam.recall(query, top_k=top_k, temporal_weight=temporal_weight)
+            if evidence_pack:
+                result = beam.recall_with_evidence_pack(
+                    query,
+                    top_k=top_k,
+                    candidate_k=candidate_k,
+                    pack_k=pack_k,
+                    temporal_weight=temporal_weight,
+                )
+            else:
+                result = beam.recall(query, top_k=top_k, temporal_weight=temporal_weight)
         except Exception as e:
             exception[0] = e
         finally:
@@ -1411,7 +1425,8 @@ def _summarize_recall_memories(memories: list) -> dict:
 def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                       conversation_messages: list = None, top_k: int = DEFAULT_TOP_K,
                       ability: str = None,
-                      return_memories: bool = False):
+                      return_memories: bool = False,
+                      return_retrieval_metadata: bool = False):
     """Retrieve memories and have LLM answer, with context strategy based on conversation size.
 
     Set `MNEMOSYNE_BENCHMARK_PURE_RECALL=1` to disable the per-ability
@@ -1429,12 +1444,24 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         element is the retrieved memories list (post-multi-strategy,
         pre-LLM-context-build). Each memory dict carries `voice_scores`
         from Gap G -- required for per-voice attribution analysis.
+        With `return_retrieval_metadata=True`, `return_memories=True` returns
+        `(answer, memories, retrieval_metadata)`; primary and supplemental
+        evidence remain separate in that metadata.
         Bypass paths return `(answer, [])` since they short-circuit
         before recall.
     """
+    retrieval_metadata = {
+        "mode": "primary_only",
+        "primary": [],
+        "evidence_pack": [],
+        "combined_evidence_count": 0,
+    }
+
     def _ret(answer, memories=None):
         """Pack return value uniformly across all exit points."""
         if return_memories:
+            if return_retrieval_metadata:
+                return answer, (memories or []), retrieval_metadata
             return answer, (memories or [])
         return answer
     # E7/E8/E9 gate: when set, the harness disables every shortcut that
@@ -1572,8 +1599,73 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # completely bypassing Mnemosyne's retrieval pipeline.
     # This benchmark exists to measure MEMORY performance, not LLM reading comprehension.
     
-    # Multi-strategy retrieval
-    memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
+    # Default operation remains the existing primary-only, multi-strategy
+    # `BeamMemory.recall()` path. Evidence packs are an explicit opt-in arm:
+    # use the core API's primary ranking unchanged and append only its bounded,
+    # disjoint supplemental rows to the answer context.
+    _evidence_pack_enabled = _env_truthy("MNEMOSYNE_BENCHMARK_EVIDENCE_PACK")
+    if _evidence_pack_enabled:
+        packed = _recall_safe(
+            beam,
+            question,
+            top_k,
+            evidence_pack=True,
+            candidate_k=top_k * EVIDENCE_PACK_CANDIDATE_MULTIPLIER,
+            pack_k=EVIDENCE_PACK_MAX_ITEMS,
+        )
+        # _recall_safe() deliberately returns [] for its timeout/error path.
+        # Keep that established graceful-degradation sentinel distinct from
+        # malformed non-empty core-API responses, which must still fail loudly.
+        if isinstance(packed, list) and not packed:
+            primary_memories = []
+            supplemental_memories = []
+        else:
+            if not isinstance(packed, Mapping):
+                raise TypeError("recall_with_evidence_pack() must return a mapping")
+            missing_fields = {"primary", "evidence_pack"}.difference(packed)
+            if missing_fields:
+                raise ValueError(
+                    "recall_with_evidence_pack() response is missing required "
+                    f"field(s): {', '.join(sorted(missing_fields))}"
+                )
+            primary_memories = packed["primary"]
+            supplemental_memories = packed["evidence_pack"]
+            for field_name, rows in (
+                ("primary", primary_memories),
+                ("evidence_pack", supplemental_memories),
+            ):
+                if not isinstance(rows, list):
+                    raise TypeError(
+                        "recall_with_evidence_pack() response field "
+                        f"{field_name!r} must be a list"
+                    )
+                for index, row in enumerate(rows):
+                    if not isinstance(row, Mapping):
+                        raise TypeError(
+                            "recall_with_evidence_pack() response field "
+                            f"{field_name!r} row {index} must be a mapping"
+                        )
+        memories = [
+            {**memory, "_evidence_role": "primary"}
+            for memory in primary_memories
+        ] + [
+            {**memory, "_evidence_role": "supplemental"}
+            for memory in supplemental_memories
+        ]
+        retrieval_metadata = {
+            "mode": "evidence_pack",
+            "primary": primary_memories,
+            "evidence_pack": supplemental_memories,
+            "combined_evidence_count": len(memories),
+        }
+    else:
+        memories = _multi_strategy_recall(beam, question, top_k * 3, ability=ability)  # Get 3x more for reranking
+        retrieval_metadata = {
+            "mode": "primary_only",
+            "primary": memories,
+            "evidence_pack": [],
+            "combined_evidence_count": len(memories),
+        }
 
     # ---- MEMORIA: Structured Fact Retrieval (Phase 2) ----
     # Supplement recall with structured facts from memoria_facts, memoria_timelines,
@@ -1589,6 +1681,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                 "content": f"[MEMORIA {_memoria_result['source']}]\n{_memoria_result['context']}",
                 "score": 0.95,
                 "source": f"memoria_{_memoria_result['source']}",
+                "_evidence_role": "memoria",
             })
     except Exception:
         pass  # MEMORIA retrieval is best-effort
@@ -1643,6 +1736,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
                     "content": f"FACT: {f['content']}",
                     "score": f.get("score", 0.5) * 2.0,  # 2x weight for facts
                     "source": "fact_extraction",
+                    "_evidence_role": "cloud_fact",
                 })
             # Re-sort by score
             memories.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -1665,21 +1759,23 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
         (r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}\b', 1.0),  # proper noun phrases
         (r'\b[A-Z]{2,8}\b', 0.8),  # acronyms
     ]
-    for mem in memories:
-        content = mem.get("content", "")
-        fact_score = 0.0
-        for pattern, weight in _FACT_PATTERNS:
-            matches = _re_facts.findall(pattern, content)
-            fact_score += len(matches) * weight
-        # Normalize by content length to get fact density
-        density = fact_score / max(len(content.split()), 1)
-        mem["fact_density"] = round(density, 4)
-        # Boost score: blend original with fact density (40% fact boost)
-        orig = mem.get("score", mem.get("relevance", 0))
-        mem["score"] = orig * 0.6 + min(density * 5.0, 1.0) * 0.4
+    if not _evidence_pack_enabled:
+        for mem in memories:
+            content = mem.get("content", "")
+            fact_score = 0.0
+            for pattern, weight in _FACT_PATTERNS:
+                matches = _re_facts.findall(pattern, content)
+                fact_score += len(matches) * weight
+            # Normalize by content length to get fact density
+            density = fact_score / max(len(content.split()), 1)
+            mem["fact_density"] = round(density, 4)
+            # Boost score: blend original with fact density (40% fact boost)
+            orig = mem.get("score", mem.get("relevance", 0))
+            mem["score"] = orig * 0.6 + min(density * 5.0, 1.0) * 0.4
 
-    # Re-sort by boosted score
-    memories.sort(key=lambda m: m.get("score", 0), reverse=True)
+        # Preserve primary-only behavior exactly. The evidence arm keeps the
+        # core API's primary order rather than re-ranking it in the harness.
+        memories.sort(key=lambda m: m.get("score", 0), reverse=True)
     
     # Build recent context from last N messages (needed by both recursive and non-recursive paths).
     # Pure-recall mode SKIPS this entirely.
@@ -1697,7 +1793,7 @@ def answer_with_memory(llm: LLMClient, beam: BeamMemory, question: str,
     # Pass 1: answer with current context -> Pass 2: gap analysis + targeted re-retrieval + re-answer.
     _RECURSIVE_ABILITIES = {'TR', 'EO', 'CR'}
     
-    if ability in _RECURSIVE_ABILITIES:
+    if ability in _RECURSIVE_ABILITIES and not _evidence_pack_enabled:
         # --- Helper: build context string from memory list ---
         def _build_context(mems, recents):
             ctx_blocks = []
@@ -1957,13 +2053,27 @@ Follow this format strictly:
         if isinstance(score, (int, float)) and score < 0.05:
             continue  # Skip very low relevance
             
+        evidence_role = mem.get("_evidence_role")
+        label = (
+            "Primary memory" if evidence_role == "primary" else
+            "Supplemental evidence" if evidence_role == "supplemental" else
+            "MEMORIA fact" if evidence_role == "memoria" else
+            "Cloud fact" if evidence_role == "cloud_fact" else
+            "Memory"
+        )
         if total_chars + len(content) > MAX_MEMORY_CONTEXT_CHARS:
             remaining = MAX_MEMORY_CONTEXT_CHARS - total_chars
             if remaining > 100:
-                memory_parts.append(f"[Memory] {content[:remaining]}...")
+                memory_parts.append(f"[{label}] {content[:remaining]}...")
             break
-        memory_parts.append(f"[Memory] {content}")
+        memory_parts.append(f"[{label}] {content}")
         total_chars += len(content)
+
+    # Evidence-pack diagnostics describe the rows actually rendered into the
+    # answer context, including explicitly separate MEMORIA/cloud additions.
+    # Preserve the primary-only arm's established diagnostic behavior.
+    if _evidence_pack_enabled:
+        retrieval_metadata["combined_evidence_count"] = len(memory_parts)
 
     # Build prompt with contexts (skip if full-conversation mode already set)
     if not context:
@@ -2112,14 +2222,14 @@ def evaluate_conversation(
         if not question or not ideal:
             continue
 
-        # Step 1: LLM answers using Mnemosyne memories + conversation context.
-        # `return_memories=True` gives us the per-question retrieved memory
-        # list so we can summarize voice-attribution provenance below.
+        # Preserve primary ranking provenance separately from any supplemental
+        # evidence that was included in the answer context.
         t0 = time.perf_counter()
-        ai_answer, recall_memories = answer_with_memory(
+        ai_answer, recall_memories, retrieval_metadata = answer_with_memory(
             llm, beam, question,
             conversation_messages=conversation.get("messages", []),
             ability=ability, return_memories=True,
+            return_retrieval_metadata=True,
         )
         answer_time = time.perf_counter() - t0
 
@@ -2140,7 +2250,20 @@ def evaluate_conversation(
         # from the result file directly -- no DB re-query needed. Full
         # memory dicts would be ~10× larger; this summary captures
         # what an analyst actually needs.
-        recall_provenance = _summarize_recall_memories(recall_memories)
+        # Keep the established primary-recall metric primary-only. The
+        # additive diagnostic records combined evidence without overwriting it.
+        # Keep primary ranking diagnostics separate from combined answer
+        # context. The supplemental pack is an additive arm, never a
+        # replacement for the primary recall metric.
+        recall_provenance = _summarize_recall_memories(
+            retrieval_metadata["primary"]
+        )
+        evidence_pack_diagnostics = {
+            "enabled": retrieval_metadata["mode"] == "evidence_pack",
+            "primary_recall_count": len(retrieval_metadata["primary"]),
+            "supplemental_evidence_count": len(retrieval_metadata["evidence_pack"]),
+            "combined_evidence_count": retrieval_metadata["combined_evidence_count"],
+        }
 
         result = {
             "qid": qid,
@@ -2149,6 +2272,8 @@ def evaluate_conversation(
             "ideal_answer": ideal[:200],
             "ai_answer": ai_answer[:500],
             "recall_provenance": recall_provenance,
+            "retrieval_mode": retrieval_metadata["mode"],
+            "evidence_pack_diagnostics": evidence_pack_diagnostics,
             "score": score,
             "nuggets": judgment.get("nuggets", []),
             "assessment": judgment.get("brief_assessment", ""),
@@ -2308,6 +2433,11 @@ def main():
                              "BEAM-recovery experiment needs to measure arm-vs-arm "
                              "recall quality without harness-side oracle contamination. "
                              "Equivalent to MNEMOSYNE_BENCHMARK_PURE_RECALL=1.")
+    parser.add_argument("--evidence-pack", action="store_true",
+                        help="Opt into primary recall plus bounded, disjoint supplemental "
+                             "evidence via BeamMemory.recall_with_evidence_pack(). "
+                             "Primary ranking metrics remain separate. Equivalent to "
+                             "MNEMOSYNE_BENCHMARK_EVIDENCE_PACK=1.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from previous results file")
     parser.add_argument("--dry-run", action="store_true",
@@ -2350,6 +2480,10 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+
+    if args.evidence_pack:
+        os.environ["MNEMOSYNE_BENCHMARK_EVIDENCE_PACK"] = "1"
+    _evidence_pack_active = _env_truthy("MNEMOSYNE_BENCHMARK_EVIDENCE_PACK")
 
     # Snapshot the full benchmark-relevant env-var surface so results JSON captures
     # exactly which configuration the run executed under. A toggle the operator
@@ -2404,6 +2538,8 @@ def main():
     print(f"  Sample: {sample_size or 'ALL'} conversations/scale")
     print(f"  Model: {args.model}")
     print(f"  Judge: {args.judge_model or args.model}")
+    if _evidence_pack_active:
+        print("  Retrieval: EVIDENCE-PACK (primary ranking + supplemental evidence)")
     # Mode resolution + banner. Pure-recall overrides full-context
     # because the bypass that full-context provides (raw conversation
     # straight to LLM) is exactly what pure-recall is meant to forbid.
@@ -2421,6 +2557,37 @@ def main():
         os.environ["FULL_CONTEXT_MODE"] = "1"
         print("  Mode: FULL-CONTEXT (bypassing retrieval)")
     print(f"{'='*80}")
+
+    # Validate a resumed artifact's retrieval arm before loading data or
+    # populating resume_ids. Mixing primary-only and evidence-pack rows would
+    # silently relabel a baseline as an evidence-arm result on the next save.
+    resume_ids = set()
+    all_previous = []
+    if args.resume and RESULTS_FILE.exists():
+        print(f"\n  Resuming from {RESULTS_FILE}...")
+        with open(RESULTS_FILE) as f:
+            prev = json.load(f)
+        prior_evidence_pack = (
+            prev.get("metadata", {}).get("config", {}).get("evidence_pack")
+        )
+        if (
+            not isinstance(prior_evidence_pack, bool)
+            or prior_evidence_pack != _evidence_pack_active
+        ):
+            print(
+                "ERROR: cannot resume a results artifact from a different "
+                "evidence-pack arm. Existing artifact metadata.config."
+                f"evidence_pack={prior_evidence_pack!r}, but the active run has "
+                f"evidence_pack={_evidence_pack_active!r}. Run without --resume "
+                "or use a matching results artifact.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        all_previous = prev.get("results", [])
+        for conv_result in all_previous:
+            for r in conv_result.get("results", []):
+                resume_ids.add(r["qid"])
+        print(f"  Already evaluated: {len(resume_ids)} questions")
 
     # Load data
     print(f"\n[1/4] Loading BEAM dataset...")
@@ -2440,19 +2607,6 @@ def main():
     if args.dry_run:
         print(f"\n  Dry run complete. Exiting.")
         return
-
-    # Load previous results if resuming
-    resume_ids = set()
-    all_previous = []
-    if args.resume and RESULTS_FILE.exists():
-        print(f"\n  Resuming from {RESULTS_FILE}...")
-        with open(RESULTS_FILE) as f:
-            prev = json.load(f)
-            all_previous = prev.get("results", [])
-            for conv_result in all_previous:
-                for r in conv_result.get("results", []):
-                    resume_ids.add(r["qid"])
-        print(f"  Already evaluated: {len(resume_ids)} questions")
 
     # Initialize LLM clients
     print(f"\n[2/4] Initializing LLM clients...")
@@ -2559,6 +2713,7 @@ def main():
                 "config": {
                     "env": _benchmark_env_snapshot,
                     "pure_recall": _pr_active,
+                    "evidence_pack": _evidence_pack_active,
                     "allow_harness_oracles": args.allow_harness_oracles,
                     "full_context": args.full_context,
                     "use_cloud": args.use_cloud,
