@@ -567,6 +567,14 @@ class Mnemosyne:
         write and control its id -- media ingest, importers -- should call
         BeamMemory.remember directly rather than going through here.
         """
+        from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+        policy = current_write_policy()
+        if not admit_memory_write(
+            content, write_kind=_write_kind, policy=policy
+        )[0]:
+            return None  # type: ignore[return-value]
+
         # BEAM write first (generates its own ID). Extract flags are passed
         # through so BeamMemory's canonical _extract_and_store_entities and
         # _extract_and_store_facts helpers run — these populate the `facts`
@@ -610,6 +618,8 @@ class Mnemosyne:
                 memory_type=memory_type,
                 dedupe=dedupe,
                 _write_kind=_write_kind,
+                _write_policy=policy,
+                _write_policy_content=content,
             )
             if memory_id is None:
                 return None  # type: ignore[return-value]

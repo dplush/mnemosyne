@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -226,3 +227,191 @@ def test_provider_sync_effective_config_and_raw_admission(
         "rows": ["[ASSISTANT] allowed assistant response"], "same_env": True,
         "mode": "strict", "patterns": expected,
     }
+
+
+_APPROVAL_SCRIPT = r"""
+import importlib, json, logging, os, sys, types
+from pathlib import Path
+
+h = types.ModuleType("hermes_constants")
+h.get_hermes_home = lambda: Path(os.environ["HERMES_HOME"])
+sys.modules.setdefault("hermes_constants", h)
+hc = types.ModuleType("hermes_cli.config")
+hc.load_config = lambda: {"memory": {"write_approval": True}}
+hc.cfg_get = lambda cfg, *keys, default=None: (
+    cfg.get(keys[0], {}).get(keys[1], default) if len(keys) == 2 else default
+)
+hp = types.ModuleType("hermes_cli")
+hp.__path__ = []
+hp.config = hc
+sys.modules.setdefault("hermes_cli", hp)
+sys.modules.setdefault("hermes_cli.config", hc)
+
+module = importlib.import_module(os.environ["PROVIDER"])
+provider = module.MnemosyneMemoryProvider()
+provider.initialize(
+    "issue821-approval",
+    hermes_home=os.environ["HERMES_HOME"],
+    ignore_patterns=[r"^ISSUE821"],
+    write_classifier="strict",
+    auto_sleep=False,
+)
+allowed_id = provider._beam.remember(
+    "allowed original", _write_policy=type(provider._write_policy)((), "off")
+)
+
+class Capture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+    def emit(self, record):
+        self.messages.append(self.format(record))
+
+capture = Capture()
+logging.getLogger().addHandler(capture)
+marker = os.environ["SECRET"]
+remember = provider.handle_tool_call("mnemosyne_remember", {"content": marker})
+batch = provider.handle_tool_call("mnemosyne_batch", {"operations": [
+    {"action": "remember", "content": marker + " remember"},
+    {"action": "update", "memory_id": allowed_id, "content": marker + " update"},
+]})
+pending_root = Path(os.environ["HERMES_HOME"]) / "pending"
+pending_files = list(pending_root.rglob("*")) if pending_root.exists() else []
+pending_text = "\n".join(
+    path.read_text(errors="replace") for path in pending_files if path.is_file()
+)
+non_content = json.loads(provider.handle_tool_call("mnemosyne_batch", {"operations": [
+    {"action": "update", "memory_id": allowed_id, "importance": 0.9},
+    {"action": "forget", "memory_id": allowed_id},
+]}))
+non_content_records = []
+for result in non_content["results"]:
+    record_path = pending_root / "memory" / (result["pending_id"] + ".json")
+    non_content_records.append(json.loads(record_path.read_text())["payload"])
+    record_path.unlink()
+rejected_pending = module._stage_pending_write({
+    "tool": "mnemosyne_remember", "content": marker + " apply"
+})
+allowed_pending = module._stage_pending_write({
+    "tool": "mnemosyne_remember", "content": "allowed pending content"
+})
+apply_response = provider.handle_tool_call(
+    "mnemosyne_apply_pending", {"pending_ids": [rejected_pending, allowed_pending]}
+)
+print(json.dumps({
+    "remember": json.loads(remember),
+    "batch": json.loads(batch),
+    "pending_exists": pending_root.exists(),
+    "pending_entries": [str(path.relative_to(pending_root)) for path in pending_files],
+    "pending_text": pending_text,
+    "non_content": non_content,
+    "non_content_records": non_content_records,
+    "apply_response": json.loads(apply_response),
+    "pending_after_apply": [str(path) for path in pending_root.rglob("*.json")],
+    "marker_rows": provider._beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%ISSUE821%'"
+    ).fetchone()[0],
+    "allowed_rows": provider._beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE content = 'allowed pending content'"
+    ).fetchone()[0],
+    "logs": capture.messages,
+    "original": provider._beam.get(allowed_id)["content"],
+}))
+"""
+
+
+@pytest.mark.parametrize("provider", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_write_approval_rejects_before_pending_persistence(
+    tmp_path: Path, provider: str
+):
+    home = tmp_path / "hermes"
+    data = tmp_path / "data"
+    home.mkdir(); data.mkdir()
+    (home / "config.yaml").write_text("memory:\n  write_approval: true\n")
+    marker = "ISSUE821 pending persistence marker"
+    payload = _run(_APPROVAL_SCRIPT, {
+        "PROVIDER": provider,
+        "HERMES_HOME": str(home),
+        "MNEMOSYNE_DATA_DIR": str(data),
+        "MNEMOSYNE_NO_EMBEDDINGS": "1",
+        "MNEMOSYNE_HOST_LLM_ENABLED": "0",
+        "SECRET": marker,
+    })
+    assert payload["remember"] == {"status": "filtered"}
+    assert payload["batch"]["status"] == "filtered"
+    assert payload["batch"]["results"] == [
+        {"index": 0, "action": "remember", "status": "filtered"},
+        {"index": 1, "action": "update", "status": "filtered"},
+    ]
+    assert payload["pending_entries"] == []
+    assert payload["original"] == "allowed original"
+    assert payload["non_content"]["status"] == "staged"
+    assert [result["status"] for result in payload["non_content"]["results"]] == [
+        "staged", "staged",
+    ]
+    assert [record["memory_id"] for record in payload["non_content_records"]] == [
+        payload["non_content_records"][0]["memory_id"],
+        payload["non_content_records"][0]["memory_id"],
+    ]
+    assert payload["apply_response"]["applied_count"] == 1
+    assert payload["apply_response"]["failed_count"] == 1
+    assert payload["apply_response"]["failed"][0]["error"] == "filtered"
+    assert payload["pending_after_apply"] == []
+    assert payload["marker_rows"] == 0
+    assert payload["allowed_rows"] == 1
+    assert marker not in json.dumps(payload)
+
+
+def test_facade_data_uri_is_admitted_before_blob_or_sql_mutation(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne.core import filters
+    from mnemosyne.core.filters import WritePolicySnapshot
+    from mnemosyne.core.memory import Mnemosyne
+
+    blob_dir = tmp_path / "blobs"
+    monkeypatch.setenv("MNEMOSYNE_BLOB_DIR", str(blob_dir))
+    raw = b"issue 821 binary"
+    content = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    strict = WritePolicySnapshot((r"^data:",), "strict")
+    resolutions = 0
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return strict
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    memory = Mnemosyne(session_id="facade-data-uri", db_path=tmp_path / "facade.db")
+    try:
+        assert memory.remember(content) is None
+        assert resolutions == 1
+        assert memory.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert memory.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        assert not blob_dir.exists()
+    finally:
+        memory.conn.close()
+
+
+def test_facade_allowed_data_uri_preserves_blob_extraction(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.memory import Mnemosyne
+
+    blob_dir = tmp_path / "allowed-blobs"
+    monkeypatch.setenv("MNEMOSYNE_BLOB_DIR", str(blob_dir))
+    content = "data:image/png;base64," + base64.b64encode(b"allowed binary").decode("ascii")
+    memory = Mnemosyne(session_id="facade-data-uri-allowed", db_path=tmp_path / "allowed.db")
+    try:
+        with write_policy_operation(WritePolicySnapshot((), "off")):
+            memory_id = memory.remember(content)
+        assert memory_id is not None
+        row = memory.beam.get(memory_id)
+        assert row is not None
+        assert row["content"].startswith("[Binary content extracted")
+        metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"]
+        assert metadata["_blob"]["blob_ref"].startswith("blob://sha256/")
+        assert any(path.is_file() for path in blob_dir.rglob("*"))
+    finally:
+        memory.conn.close()

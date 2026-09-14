@@ -2283,6 +2283,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         # Write-approval gate: stage to pending when enabled.
         if _write_approval_enabled():
+            from mnemosyne.core.filters import admit_memory_write
+
+            policy = getattr(self, "_write_policy", None)
+            if not admit_memory_write(content, policy=policy)[0]:
+                return json.dumps({"status": "filtered"})
             pid = _stage_pending_write({
                 "tool": "mnemosyne_remember",
                 "content": content, "importance": importance,
@@ -2337,24 +2342,39 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
         # Write-approval gate: stage each operation to pending when enabled.
         if _write_approval_enabled():
+            from mnemosyne.core.filters import admit_memory_write
+
+            policy = getattr(self, "_write_policy", None)
             staged = []
+            results = []
             for op in normalized:
+                action = op["action"]
+                payload = op["payload"]
+                content = payload.get("content")
+                if (
+                    action in {"remember", "update"}
+                    and content is not None
+                    and not admit_memory_write(content, policy=policy)[0]
+                ):
+                    results.append({
+                        "index": op["index"], "action": action, "status": "filtered",
+                    })
+                    continue
                 pid = _stage_pending_write({
+                    **payload,
                     "tool": "mnemosyne_batch",
-                    "action": op.get("action"),
-                    "content": op.get("content", ""),
-                    "importance": op.get("importance", 0.5),
-                    "source": op.get("source", "user"),
-                    "scope": op.get("scope", self._default_scope),
-                    "valid_until": op.get("valid_until"),
-                    "metadata": op.get("metadata"),
-                    "veracity": op.get("veracity"),
-                    "memory_id": op.get("memory_id"),
+                    "action": action,
                 })
-                staged.append({"action": op.get("action"), "pending_id": pid})
+                staged.append({"action": action, "pending_id": pid})
+                results.append({
+                    "index": op["index"], "action": action,
+                    "status": "staged", "pending_id": pid,
+                })
             return json.dumps({
-                "status": "staged", "staged": staged,
+                "status": "staged" if staged else "filtered", "staged": staged,
                 "staged_count": len(staged),
+                "filtered_count": len(results) - len(staged),
+                "results": results,
                 "message": "Batch write staged for approval. Use mnemosyne_apply_pending to commit.",
             })
 
@@ -3034,6 +3054,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 )
                 if mid is None:
                     failed.append({"id": pid, "error": "filtered"})
+                    rp.unlink(missing_ok=True)
                     continue
                 rp.unlink(missing_ok=True)
                 applied.append({"id": pid, "memory_id": mid})
