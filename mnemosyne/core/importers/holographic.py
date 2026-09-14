@@ -268,8 +268,12 @@ class HolographicImporter(BaseImporter):
                         metadata=mem_dict.get("metadata", {}),
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind="restore",
                         extract_entities=self.extract_entities,
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     result.memory_ids.append(mid)
                     result.imported += 1
 

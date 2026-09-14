@@ -118,7 +118,11 @@ class BaseImporter(ABC):
                         metadata=mem_dict.get("metadata", {}),
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind="restore",
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     result.memory_ids.append(mid)
                     result.imported += 1
                 except Exception as e:

@@ -536,7 +536,8 @@ class Mnemosyne:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 _write_kind: str = "public") -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.
@@ -608,6 +609,7 @@ class Mnemosyne:
                 trust_tier=trust_tier,
                 memory_type=memory_type,
                 dedupe=dedupe,
+                _write_kind=_write_kind,
             )
             if memory_id is None:
                 return None  # type: ignore[return-value]
@@ -825,6 +827,14 @@ class Mnemosyne:
     def update(self, memory_id: str, content: str = None,
                importance: float = None) -> bool:
         """Update an existing memory in legacy table and BEAM."""
+        policy = None
+        if content is not None:
+            from mnemosyne.core.filters import admit_memory_write, resolve_write_policy
+
+            policy = resolve_write_policy()
+            if not admit_memory_write(content, policy=policy)[0]:
+                return None  # type: ignore[return-value]
+
         cursor = self.conn.cursor()
 
         updates = []
@@ -850,7 +860,12 @@ class Mnemosyne:
             self.conn.commit()
 
             # Sync BEAM working_memory
-            self.beam.update_working(memory_id, content=content, importance=importance)
+            self.beam.update_working(
+                memory_id,
+                content=content,
+                importance=importance,
+                _write_policy=policy,
+            )
 
         self._emit_wrapper("MEMORY_UPDATED", memory_id, content=content, importance=importance)
         return cursor.rowcount > 0

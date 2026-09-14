@@ -300,6 +300,9 @@ def _handle_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         veracity=veracity,
     )
 
+    if memory_id is None:
+        return {"status": "filtered", "bank": bank}
+
     return {
         "status": "stored",
         "memory_id": memory_id,
@@ -439,7 +442,11 @@ def _handle_shared_remember(arguments: Dict[str, Any]) -> Dict[str, Any]:
         metadata=meta,
         scope="global",
         memory_id=stable_id,
+        _write_policy_content=content,
     )
+
+    if memory_id is None:
+        return {"status": "filtered_shared", "kind": kind}
 
     return {
         "status": "stored_shared",
@@ -572,6 +579,16 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"unknown store: {store}"}
     if action == "update" and not new_content:
         return {"error": "new_content is required for action='update'"}
+    if action == "update":
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(new_content)[0]:
+            return {
+                "status": "filtered",
+                "memory_id": memory_id,
+                "store": store,
+                "bank": bank,
+            }
 
     if store == "surface":
         target_beam = _create_surface_instance()

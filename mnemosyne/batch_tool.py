@@ -218,6 +218,8 @@ def _apply_one(
             content=payload.get("content"),
             importance=float(importance) if importance is not None else None,
         )
+        if ok is None:
+            return {"index": index, "action": action, "status": "filtered"}
         if not ok:
             raise BatchOperationError("memory_not_found")
         audit_events.append(("update", {"memory_id": memory_id, "bank": "private", "source_tool": remember_source_tool}))

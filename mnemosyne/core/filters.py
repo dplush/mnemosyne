@@ -326,19 +326,31 @@ def resolve_write_policy() -> WritePolicySnapshot:
     )
 
 
+def make_write_policy(
+    ignore_patterns: object, classifier_mode: object
+) -> WritePolicySnapshot:
+    """Build a normalized immutable snapshot from already-resolved values."""
+    return WritePolicySnapshot(
+        ignore_patterns=_coerce_patterns(ignore_patterns),
+        classifier_mode=_normalize_classifier_mode(classifier_mode),
+    )
+
+
 def current_write_policy() -> WritePolicySnapshot:
     """Return the enclosing operation snapshot, or resolve a new one."""
     return _active_write_policy.get() or resolve_write_policy()
 
 
 @contextmanager
-def write_policy_operation() -> Iterator[WritePolicySnapshot]:
+def write_policy_operation(
+    policy: Optional[WritePolicySnapshot] = None,
+) -> Iterator[WritePolicySnapshot]:
     """Keep all writes in one public operation on one policy snapshot."""
     existing = _active_write_policy.get()
     if existing is not None:
         yield existing
         return
-    snapshot = resolve_write_policy()
+    snapshot = policy or resolve_write_policy()
     token = _active_write_policy.set(snapshot)
     try:
         yield snapshot

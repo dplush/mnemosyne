@@ -1667,6 +1667,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 patterns = [str(p).strip() for p in patterns if str(p).strip()]
             self._ignore_patterns = patterns
 
+        # Capture the provider's effective policy without bridging through
+        # os.environ. Explicit kwargs and Hermes config keep their precedence.
+        from mnemosyne.core.filters import make_write_policy, resolve_write_policy
+        configured_mode = kwargs.get("write_classifier")
+        if configured_mode is None:
+            configured_mode = read_hermes_config_key(
+                getattr(self, "_hermes_home", None), "write_classifier"
+            )
+        hermes_mode_explicit = configured_mode is not None
+        if configured_mode is None:
+            configured_mode = resolve_write_policy().classifier_mode
+        if self._ignore_patterns and not hermes_mode_explicit and configured_mode == "off":
+            # Provider ignore_patterns historically filtered sync_turn even
+            # before write_classifier existed.
+            configured_mode = "strict"
+        self._write_policy = make_write_policy(self._ignore_patterns, configured_mode)
+
         # profile_isolation: separate DB per Hermes profile (bank-based).
         # Default OFF. When enabled, each profile derives its own Mnemosyne bank.
         profile_isolation = kwargs.get("profile_isolation")
@@ -2442,7 +2459,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         try:
             from mnemosyne.core.filters import write_policy_operation
-            with write_policy_operation(), self._ensure_beam_access_lock():
+            with write_policy_operation(
+                getattr(self, "_write_policy", None)
+            ), self._ensure_beam_access_lock():
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
                     self._active_session_id = ledger_session_id
@@ -2458,6 +2477,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         importance=0.5,
                         scope=self._default_scope,
                         extract_entities=True,
+                        _write_policy_content=user_content,
                     )
                     self._capture_identity_signals(user_content)
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
@@ -2472,6 +2492,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         importance=0.15,
                         scope=self._default_scope,
                         extract_entities=True,
+                        _write_policy_content=assistant_content,
                     )
             self._turn_count += 1
             if self._auto_sleep_enabled and self._turn_count % 10 == 0:
@@ -2574,6 +2595,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     importance=0.85,
                     scope="global",
                     veracity="stated",
+                    _write_kind="system_derived",
+                    _write_policy=getattr(self, "_write_policy", None),
                 )
                 break  # One identity memory per turn
 
@@ -3719,6 +3742,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         content = args.get("content")
         importance = args.get("importance")
         ok = self._beam.update_working(memory_id, content=content, importance=importance)
+        if ok is None:
+            return json.dumps({"status": "filtered", "memory_id": memory_id})
         return json.dumps({
             "status": "updated" if ok else "not_found",
             "memory_id": memory_id,

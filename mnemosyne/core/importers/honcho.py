@@ -259,7 +259,11 @@ class HonchoImporter(BaseImporter):
                         metadata=meta,
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
+                        _write_kind="restore",
                     )
+                    if mid is None:
+                        result.skipped += 1
+                        continue
                     if author_id or author_type or chan:
                         try:
                             mnemosyne.beam.conn.execute("""
