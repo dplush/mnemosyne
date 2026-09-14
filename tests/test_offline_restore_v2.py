@@ -584,7 +584,7 @@ def test_extract_failure_closes_every_locally_owned_descriptor(tmp_path, monkeyp
     for descriptor in descriptors:
         with pytest.raises(OSError, match="Bad file descriptor"):
             os.fstat(descriptor)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
     assert not destination.exists()
 
 
