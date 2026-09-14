@@ -720,11 +720,18 @@ def _handle_triple_add(arguments: Dict[str, Any]) -> Dict[str, Any]:
     _log = logging.getLogger("mnemosyne.mcp.triple_add")
 
     from mnemosyne.core.annotations import ANNOTATION_KINDS, AnnotationStore
+    from mnemosyne.core.filters import admit_memory_write
     from mnemosyne.core.triples import TripleStore
 
     predicate = arguments["predicate"]
+    annotation_path = isinstance(predicate, str) and predicate in ANNOTATION_KINDS
+    if not admit_memory_write(arguments["object"])[0]:
+        return {
+            "status": "filtered",
+            "store": "annotations" if annotation_path else "triples",
+        }
 
-    if isinstance(predicate, str) and predicate in ANNOTATION_KINDS:
+    if annotation_path:
         bank = _resolve_bank(arguments)
         mem = _create_instance(bank=bank)
         db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path

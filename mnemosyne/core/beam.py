@@ -6572,7 +6572,9 @@ class BeamMemory:
                                 event_timestamp: 'Optional[str]' = None,
                                 event_date: 'Optional[str]' = None,
                                 event_date_precision: 'Optional[str]' = None,
-                                emit_event: bool = True) -> str:
+                                emit_event: bool = True,
+                                _write_kind: str = "public",
+                                _write_policy=None) -> str:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -6595,6 +6597,17 @@ class BeamMemory:
         values and pass it here. `None` falls back to 'unknown' (matches
         legacy behavior + schema default).
         """
+        # Public raw-content admission must precede classification, embedding,
+        # event emission, and every SQL/vector mutation. Only the sleep pipeline
+        # marks its generated summary as system-derived; direct callers remain
+        # public even when they choose source="sleep_consolidation".
+        from mnemosyne.core.filters import admit_memory_write
+        should_write, _decision = admit_memory_write(
+            summary, write_kind=_write_kind, policy=_write_policy
+        )
+        if not should_write:
+            return None  # type: ignore[return-value]
+
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under
         # a caller-owned transaction this method cannot observe the outer
@@ -11082,7 +11095,9 @@ class BeamMemory:
         """
         from mnemosyne.core.aaak import encode as aaak_encode
         from mnemosyne.core import local_llm
+        from mnemosyne.core.filters import current_write_policy
 
+        sleep_write_policy = None
         cursor = self.conn.cursor()
         _cutoff_raw = (
             datetime.now(timezone.utc)
@@ -11561,6 +11576,8 @@ class BeamMemory:
                         _agg_event_date_precision = "unknown"
                 if _agg_event_date_precision not in _EVENT_DATE_PRECISIONS:
                     _agg_event_date_precision = "unknown"
+                if sleep_write_policy is None:
+                    sleep_write_policy = current_write_policy()
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
@@ -11572,6 +11589,8 @@ class BeamMemory:
                     scope=aggregated_scope,
                     valid_until=aggregated_valid_until,
                     veracity=aggregated_veracity,
+                    _write_kind="system_derived",
+                    _write_policy=sleep_write_policy,
                     metadata={
                         "original_count": len(items),
                         "source": source,

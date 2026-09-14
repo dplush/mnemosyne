@@ -178,6 +178,182 @@ def test_sleep_proposal_is_system_derived_exempt(tmp_path: Path, monkeypatch):
         beam.conn.close()
 
 
+def test_consolidate_rejects_raw_summary_before_all_mutation(
+    tmp_path: Path, monkeypatch, caplog
+):
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import filters
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    marker = "ISSUE821 rejected episodic summary"
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    resolutions = 0
+    embedding_calls = 0
+    events = []
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return strict
+
+    def embedding_available():
+        nonlocal embedding_calls
+        embedding_calls += 1
+        return True
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    monkeypatch.setattr(beam_module._embeddings, "available", embedding_available)
+    beam = BeamMemory(
+        session_id="episodic-admission",
+        db_path=tmp_path / "episodic-admission.db",
+        event_emitter=events.append,
+    )
+    try:
+        with caplog.at_level("DEBUG"):
+            result = beam.consolidate_to_episodic(
+                marker,
+                source_wm_ids=[],
+                source="sleep_consolidation",
+            )
+        assert result is None
+        assert resolutions == 1
+        assert embedding_calls == 0
+        assert events == []
+        assert beam.conn.execute("SELECT COUNT(*) FROM episodic_memory").fetchone()[0] == 0
+        assert beam.conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 0
+        assert marker not in caplog.text
+    finally:
+        beam.conn.close()
+
+
+def test_sleep_consolidation_is_system_derived_exempt(tmp_path: Path, monkeypatch):
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import filters
+    from mnemosyne.core import local_llm, model_refresh
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    beam = BeamMemory(session_id="derived-summary", db_path=tmp_path / "derived-summary.db")
+    old = (datetime.now() - timedelta(hours=200)).isoformat()
+    for index in range(2):
+        beam.conn.execute(
+            "INSERT INTO working_memory (id, content, source, timestamp, session_id) "
+            "VALUES (?, ?, 'conversation', ?, 'derived-summary')",
+            (f"summary-source-{index}", f"allowed evidence {index}", old),
+        )
+    beam.conn.commit()
+    monkeypatch.setattr(local_llm, "llm_available", lambda: False)
+    monkeypatch.setattr(model_refresh, "infer_model_update_proposals", lambda _items: [])
+    monkeypatch.setattr(beam_module._embeddings, "available", lambda: False)
+    strict = WritePolicySnapshot((r"^\[conversation\]",), "strict")
+    resolutions = 0
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return strict
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    try:
+        result = beam.sleep(dry_run=False)
+        rows = beam.conn.execute(
+            "SELECT content FROM episodic_memory ORDER BY rowid"
+        ).fetchall()
+        assert resolutions == 1
+        assert result["items_consolidated"] == 2
+        assert result["summaries_created"] == 1
+        assert len(rows) == 1
+        assert rows[0][0].startswith("[conversation]")
+    finally:
+        beam.conn.close()
+
+
+def test_direct_mcp_triple_add_admits_annotation_and_triple_objects(
+    tmp_path: Path, monkeypatch, caplog
+):
+    from mnemosyne import mcp_tools
+    from mnemosyne.core.annotations import AnnotationStore
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.memory import Mnemosyne
+    from mnemosyne.core.triples import TripleStore
+
+    memory = Mnemosyne(session_id="mcp-triples", db_path=tmp_path / "mcp-triples.db")
+    monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: memory)
+    annotations = AnnotationStore(db_path=memory.beam.db_path, conn=memory.beam.conn)
+    triples = TripleStore(db_path=memory.beam.db_path)
+    existing_id = triples.add("user", "prefers", "allowed old value")
+    marker = "ISSUE821 rejected triple object"
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    try:
+        with write_policy_operation(strict), caplog.at_level("DEBUG"):
+            annotation = mcp_tools._handle_triple_add({
+                "subject": "memory-1", "predicate": "mentions", "object": marker,
+            })
+            triple = mcp_tools._handle_triple_add({
+                "subject": "user", "predicate": "prefers", "object": marker,
+            })
+            allowed = mcp_tools._handle_triple_add({
+                "subject": "memory-1", "predicate": "mentions", "object": "Alice",
+            })
+        assert annotation == {"status": "filtered", "store": "annotations"}
+        assert triple == {"status": "filtered", "store": "triples"}
+        assert "ISSUE821" not in json.dumps((annotation, triple))
+        assert marker not in caplog.text
+        annotation_rows = annotations.query_by_kind("mentions", memory_id="memory-1")
+        assert [row["value"] for row in annotation_rows] == ["Alice"]
+        rows = triples.conn.execute(
+            "SELECT id, object, valid_until FROM triples WHERE subject = ? AND predicate = ?",
+            ("user", "prefers"),
+        ).fetchall()
+        assert [(row[0], row[1], row[2]) for row in rows] == [
+            (existing_id, "allowed old value", None)
+        ]
+        assert allowed["status"] == "added" and allowed["store"] == "annotations"
+    finally:
+        triples.conn.close()
+        memory.conn.close()
+
+
+@pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_provider_triple_add_admits_object_before_supersede(
+    tmp_path: Path, provider_name: str, caplog
+):
+    import importlib
+
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+    from mnemosyne.core.triples import TripleStore
+
+    module = importlib.import_module(provider_name)
+    provider = module.MnemosyneMemoryProvider.__new__(module.MnemosyneMemoryProvider)
+    provider._beam = BeamMemory(
+        session_id=f"provider-triples-{provider_name}",
+        db_path=tmp_path / f"{provider_name}.db",
+    )
+    provider._write_policy = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    triples = TripleStore(db_path=provider._beam.db_path)
+    existing_id = triples.add("user", "prefers", "allowed old value")
+    marker = "ISSUE821 rejected provider triple object"
+    try:
+        with caplog.at_level("DEBUG"):
+            rejected = json.loads(provider._handle_triple_add({
+                "subject": "user", "predicate": "prefers", "object": marker,
+            }))
+        assert rejected == {"status": "filtered"}
+        assert marker not in caplog.text
+        rows = triples.conn.execute(
+            "SELECT id, object, valid_until FROM triples WHERE subject = ? AND predicate = ?",
+            ("user", "prefers"),
+        ).fetchall()
+        assert [(row[0], row[1], row[2]) for row in rows] == [
+            (existing_id, "allowed old value", None)
+        ]
+    finally:
+        triples.conn.close()
+        provider._beam.conn.close()
+
+
 _SYNC_SCRIPT = r"""
 import importlib, json, os, sys, types
 from pathlib import Path
