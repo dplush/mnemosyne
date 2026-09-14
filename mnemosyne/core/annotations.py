@@ -97,15 +97,23 @@ def filter_facts(facts: List[str]) -> List[str]:
     return [f for f in facts if f and len(f) > MIN_FACT_LENGTH]
 
 
-def _admit_annotation_values(values: List[str]) -> List[str]:
+def _admit_annotation_values(
+    values: List[str], *, write_kind: object = "public"
+) -> List[str]:
     """Return values admitted by one immutable write-policy snapshot."""
-    from mnemosyne.core.filters import admit_memory_write, current_write_policy
+    from mnemosyne.core.filters import (
+        admit_memory_write,
+        current_write_policy,
+        is_write_policy_exempt,
+    )
 
-    policy = current_write_policy()
+    # Trusted derived writes have already crossed the raw-memory admission
+    # boundary. Avoid resolving a second snapshot for their extracted values.
+    policy = None if is_write_policy_exempt(write_kind) else current_write_policy()
     return [
         value
         for value in values
-        if admit_memory_write(value, policy=policy)[0]
+        if admit_memory_write(value, write_kind=write_kind, policy=policy)[0]
     ]
 
 
@@ -256,11 +264,31 @@ class AnnotationStore:
 
         Returns the count of rows inserted. Skips empty / blank values silently.
         """
+        return self._add_many(
+            memory_id,
+            kind,
+            values,
+            source,
+            confidence,
+            _write_kind="public",
+        )
+
+    def _add_many(
+        self,
+        memory_id: str,
+        kind: str,
+        values: List[str],
+        source: str = "",
+        confidence: float = 1.0,
+        *,
+        _write_kind: object,
+    ) -> int:
+        """Internal batch insert accepting an opaque write capability."""
         if not values:
             return 0
 
         candidates = [v for v in values if v and v.strip()]
-        admitted = _admit_annotation_values(candidates)
+        admitted = _admit_annotation_values(candidates, write_kind=_write_kind)
         rows = [
             (memory_id, kind, v, source, confidence)
             for v in admitted

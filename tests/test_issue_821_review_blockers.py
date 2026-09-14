@@ -492,6 +492,33 @@ def test_direct_sdk_annotation_routes_admit_raw_values_before_mutation(
         annotations.conn.close()
 
 
+def test_admitted_memory_persists_system_derived_entity_mentions(tmp_path: Path):
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+
+    strict = WritePolicySnapshot((r"^Alice",), "strict")
+    beam = BeamMemory(session_id="entity-enrichment", db_path=tmp_path / "entities.db")
+    try:
+        with write_policy_operation(strict):
+            memory_id = beam.remember(
+                "I met Alice yesterday", extract_entities=True
+            )
+            direct_result = beam.annotations.add_many(
+                "direct-annotation",
+                "mentions",
+                ["Alice"],
+            )
+
+        rows = beam.annotations.query_by_kind("mentions", filter_noise=False)
+        assert memory_id is not None
+        assert direct_result == 0
+        assert [(row["memory_id"], row["value"]) for row in rows] == [
+            (memory_id, "Alice")
+        ]
+    finally:
+        beam.conn.close()
+
+
 @pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
 def test_provider_triple_add_admits_object_before_supersede(
     tmp_path: Path, provider_name: str, caplog
