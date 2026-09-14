@@ -333,13 +333,25 @@ class TripleStore:
             DeprecationWarning,
             stacklevel=2,
         )
-        from mnemosyne.core.annotations import AnnotationStore, filter_facts
+        from mnemosyne.core.annotations import (
+            AnnotationStore,
+            _admit_annotation_values,
+            filter_facts,
+        )
+        from mnemosyne.core.filters import write_policy_operation
+
         kept = filter_facts(facts)
         if not kept:
             return 0
-        store = AnnotationStore(db_path=self.db_path)
-        store.add_many(memory_id, "fact", kept, source=source, confidence=confidence)
-        return len(kept)
+        with write_policy_operation():
+            admitted = _admit_annotation_values(kept)
+            if not admitted:
+                return 0
+            store = AnnotationStore(db_path=self.db_path)
+            store.add_many(
+                memory_id, "fact", admitted, source=source, confidence=confidence
+            )
+            return len(admitted)
 
     def export_all(self) -> List[Dict]:
         """Export all triples to a list of dictionaries."""

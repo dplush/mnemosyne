@@ -1522,17 +1522,20 @@ def _remember_text(
     moment row bound to nothing.
     """
     try:
-        return beam.remember(
-            content,
-            source=source,
-            importance=importance,
-            metadata=metadata,
-            scope=scope,
-            memory_type="artifact",
-            dedupe=False,
-            _write_kind=write_kind,
-            _write_policy=write_policy,
-        )
+        from mnemosyne.core.filters import write_policy_operation
+
+        with write_policy_operation(write_policy):
+            return beam.remember(
+                content,
+                source=source,
+                importance=importance,
+                metadata=metadata,
+                scope=scope,
+                memory_type="artifact",
+                dedupe=False,
+                _write_kind=write_kind,
+                _write_policy=write_policy,
+            )
     except Exception:
         logger.info("media: memory write failed", exc_info=True)
         return None

@@ -367,6 +367,60 @@ def test_direct_triple_store_add_admits_object_before_supersede(tmp_path: Path):
         triples.conn.close()
 
 
+def test_direct_sdk_annotation_routes_admit_raw_values_before_mutation(
+    tmp_path: Path, caplog
+):
+    from mnemosyne.core.annotations import AnnotationStore, add_annotation
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.triples import TripleStore
+
+    db_path = tmp_path / "direct-annotations.db"
+    annotations = AnnotationStore(db_path=db_path)
+    triples = TripleStore(db_path=db_path)
+    rejected = "ISSUE821 rejected annotation value"
+    allowed = "allowed annotation value"
+    try:
+        with write_policy_operation(
+            WritePolicySnapshot((r"^ISSUE821",), "strict")
+        ), caplog.at_level("DEBUG"):
+            add_result = annotations.add("memory-add-rejected", "fact", rejected)
+            add_allowed = annotations.add("memory-add", "fact", allowed)
+            many_result = annotations.add_many(
+                "memory-many", "fact", [rejected, allowed]
+            )
+            helper_result = add_annotation(
+                "memory-helper-rejected", "fact", rejected, db_path=db_path
+            )
+            helper_allowed = add_annotation(
+                "memory-helper", "fact", allowed, db_path=db_path
+            )
+            with pytest.warns(DeprecationWarning):
+                facts_result = triples.add_facts(
+                    "memory-facts", [rejected, allowed]
+                )
+
+        assert add_result is None
+        assert isinstance(add_allowed, int)
+        assert many_result == 1
+        assert helper_result is None
+        assert isinstance(helper_allowed, int)
+        assert facts_result == 1
+        rows = annotations.conn.execute(
+            "SELECT memory_id, value FROM annotations ORDER BY memory_id"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            ("memory-add", allowed),
+            ("memory-facts", allowed),
+            ("memory-helper", allowed),
+            ("memory-many", allowed),
+        ]
+        assert rejected not in str([tuple(row) for row in rows])
+        assert rejected not in caplog.text
+    finally:
+        triples.conn.close()
+        annotations.conn.close()
+
+
 @pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
 def test_provider_triple_add_admits_object_before_supersede(
     tmp_path: Path, provider_name: str, caplog
