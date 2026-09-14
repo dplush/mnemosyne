@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
+
 
 @dataclass
 class ImporterResult:
@@ -118,7 +120,7 @@ class BaseImporter(ABC):
                         metadata=mem_dict.get("metadata", {}),
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
-                        _write_kind="restore",
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
                     if mid is None:
                         result.skipped += 1

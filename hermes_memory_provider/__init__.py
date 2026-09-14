@@ -2595,13 +2595,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         for signal in self._IDENTITY_SIGNALS:
             if signal in content_lower:
                 # Save identity memory with high importance for durable recall
+                from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
+
                 self._beam.remember(
                     content=f"[IDENTITY] {user_content[:400]}",
                     source="identity",
                     importance=0.85,
                     scope="global",
                     veracity="stated",
-                    _write_kind="system_derived",
+                    _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
                     _write_policy=getattr(self, "_write_policy", None),
                 )
                 break  # One identity memory per turn

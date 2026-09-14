@@ -354,15 +354,26 @@ def test_direct_core_and_mcp_canonical_and_scratchpad_rejections_are_atomic(
     assert memory.scratchpad_read() == []
 
 
-def test_only_restore_and_system_derived_writes_are_exempt():
-    from mnemosyne.core.filters import WritePolicySnapshot, admit_memory_write
+def test_only_internal_write_capabilities_are_exempt():
+    from mnemosyne.core.filters import (
+        _RESTORE_WRITE_CAPABILITY,
+        _SYSTEM_DERIVED_WRITE_CAPABILITY,
+        WritePolicySnapshot,
+        admit_memory_write,
+    )
 
     strict = WritePolicySnapshot(("ISSUE821",), "strict")
     assert admit_memory_write("ISSUE821", policy=strict)[0] is False
     assert admit_memory_write("ISSUE821", write_kind="batch", policy=strict)[0] is False
-    assert admit_memory_write("ISSUE821", write_kind="restore", policy=strict)[0] is True
+    assert admit_memory_write("ISSUE821", write_kind="restore", policy=strict)[0] is False
     assert admit_memory_write(
         "ISSUE821", write_kind="system_derived", policy=strict
+    )[0] is False
+    assert admit_memory_write(
+        "ISSUE821", write_kind=_RESTORE_WRITE_CAPABILITY, policy=strict
+    )[0] is True
+    assert admit_memory_write(
+        "ISSUE821", write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY, policy=strict
     )[0] is True
 
 

@@ -201,7 +201,7 @@ class CanonicalStore:
         body: str,
         source: str = "",
         confidence: float = 1.0,
-        _write_kind: str = "public",
+        _write_kind: object = "public",
     ) -> Optional[Dict]:
         """Upsert the canonical value for ``(owner_id, category, name)``.
 
@@ -589,9 +589,17 @@ def remember_canonical(
     db_path: Optional[Path] = None,
 ) -> Optional[Dict]:
     """Upsert a canonical fact without instantiating CanonicalStore manually."""
-    store = CanonicalStore(db_path=db_path)
-    return store.remember(owner_id, category, name, body,
-                          source=source, confidence=confidence)
+    from mnemosyne.core.filters import admit_memory_write, write_policy_operation
+
+    # Admission must precede CanonicalStore construction: initializing a store
+    # creates the parent directory, database file, and schema. Keep that same
+    # immutable snapshot active for the store's defensive admission check.
+    with write_policy_operation() as policy:
+        if not admit_memory_write(body, policy=policy)[0]:
+            return None
+        store = CanonicalStore(db_path=db_path)
+        return store.remember(owner_id, category, name, body,
+                              source=source, confidence=confidence)
 
 
 def recall_canonical(

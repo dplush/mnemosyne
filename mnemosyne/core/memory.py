@@ -537,7 +537,7 @@ class Mnemosyne:
                  trust_tier: str = None,
                  memory_type: str = None,
                  dedupe: bool = True,
-                 _write_kind: str = "public") -> str:
+                 _write_kind: object = "public") -> str:
         """
         Store a memory directly to SQLite.
         Writes to both BEAM working_memory and legacy memories table.

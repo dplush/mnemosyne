@@ -31,6 +31,77 @@ def _run(script: str, env: dict[str, str]) -> dict:
     return json.loads(result.stdout)
 
 
+def test_public_sdk_cannot_claim_internal_write_exemption(tmp_path: Path):
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.canonical import CanonicalStore
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.memory import Mnemosyne
+
+    facade = Mnemosyne(session_id="public-facade", db_path=tmp_path / "facade.db")
+    beam = BeamMemory(session_id="public-beam", db_path=tmp_path / "beam.db")
+    canonical = CanonicalStore(db_path=tmp_path / "canonical.db")
+    media_beam = BeamMemory(session_id="public-media", db_path=tmp_path / "media.db")
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    try:
+        with write_policy_operation(strict):
+            for claimed_kind in ("restore", "system_derived"):
+                assert facade.remember(
+                    "ISSUE821 facade exemption claim", _write_kind=claimed_kind
+                ) is None
+                assert beam.remember(
+                    "ISSUE821 beam exemption claim", _write_kind=claimed_kind
+                ) is None
+                assert canonical.remember(
+                    "owner", "identity", "name",
+                    "ISSUE821 canonical exemption claim",
+                    _write_kind=claimed_kind,
+                ) is None
+                media_result = media_beam.remember_media(
+                    "ISSUE821 media exemption claim", _write_kind=claimed_kind
+                )
+                assert media_result.status == "filtered"
+                assert media_result.asset_id == ""
+
+        assert facade.conn.execute(
+            "SELECT COUNT(*) FROM working_memory"
+        ).fetchone()[0] == 0
+        assert facade.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        assert beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert canonical.conn.execute(
+            "SELECT COUNT(*) FROM canonical_facts"
+        ).fetchone()[0] == 0
+        assert media_beam.conn.execute(
+            "SELECT COUNT(*) FROM media_assets"
+        ).fetchone()[0] == 0
+        assert media_beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory"
+        ).fetchone()[0] == 0
+    finally:
+        facade.conn.close()
+        beam.conn.close()
+        canonical.conn.close()
+        media_beam.conn.close()
+
+
+def test_direct_remember_canonical_rejects_before_store_initialization(
+    tmp_path: Path,
+):
+    from mnemosyne.core.canonical import remember_canonical
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+
+    parent = tmp_path / "new-parent"
+    db_path = parent / "canonical.db"
+    with write_policy_operation(WritePolicySnapshot((r"^ISSUE821",), "strict")):
+        result = remember_canonical(
+            "owner", "identity", "name", "ISSUE821 rejected canonical body",
+            db_path=db_path,
+        )
+
+    assert result is None
+    assert not db_path.exists()
+    assert not parent.exists()
+
+
 def test_file_import_restore_exemption_and_null_accounting(tmp_path: Path):
     from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
     from mnemosyne.core.importers.base import import_from_file

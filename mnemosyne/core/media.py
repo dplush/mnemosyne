@@ -1318,7 +1318,7 @@ def remember_media(
     captured_at: Optional[str] = None,
     captured_at_precision: str = "unknown",
     metadata: Optional[Dict[str, Any]] = None,
-    _write_kind: str = "public",
+    _write_kind: object = "public",
     _write_policy=None,
 ) -> MediaIngestResult:
     """Register a piece of media and, if a provider is configured, describe it.
@@ -1356,8 +1356,8 @@ def remember_media(
     """
     # Admit the caller's raw reference before data-URI normalization can write
     # a blob, and keep every derived write on this operation's immutable policy
-    # snapshot. Internal restore/system-derived exemptions apply only when the
-    # caller explicitly supplied that write kind.
+    # snapshot. Internal exemptions require an opaque in-process capability;
+    # caller-supplied strings such as "restore" cannot bypass admission.
     from mnemosyne.core.filters import admit_memory_write, current_write_policy
 
     write_policy = _write_policy or current_write_policy()
@@ -1466,7 +1466,7 @@ def remember_media(
 def _ensure_anchor_memory(
     beam, store: MediaStore, asset_id: str, ref_kind: str, ref_value: str,
     modality: str, *, title: Optional[str], source: str, importance: float,
-    scope: str, write_kind: str, write_policy,
+    scope: str, write_kind: object, write_policy,
 ) -> Optional[str]:
     """Write (or reuse) the reference memory for an asset.
 
@@ -1505,7 +1505,7 @@ def _ensure_anchor_memory(
 
 def _remember_text(
     beam, content: str, *, source: str, importance: float, scope: str,
-    metadata: Dict[str, Any], write_kind: str, write_policy,
+    metadata: Dict[str, Any], write_kind: object, write_policy,
 ) -> Optional[str]:
     """Write one memory row for media.
 
@@ -1670,7 +1670,7 @@ def _span_kind_for(item, modality: str) -> str:
 def _bind_moment_memories(
     beam, store: MediaStore, asset_id: str, drafts: List[MomentDraft],
     moment_ids: List[str], *, source: str, importance: float, scope: str,
-    provider: Optional[str], model: Optional[str], write_kind: str, write_policy,
+    provider: Optional[str], model: Optional[str], write_kind: object, write_policy,
 ) -> List[str]:
     """Write a memory row per *newly unbound* moment and bind it.
 

@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 from typing import List, Dict
 
+from mnemosyne.core.filters import _RESTORE_WRITE_CAPABILITY
 from mnemosyne.core.importers.base import BaseImporter, ImporterResult
 
 
@@ -236,7 +237,7 @@ class SuperMemoryImporter(BaseImporter):
                         metadata=meta,
                         valid_until=mem_dict.get("valid_until"),
                         scope=mem_dict.get("scope", "session"),
-                        _write_kind="restore",
+                        _write_kind=_RESTORE_WRITE_CAPABILITY,
                     )
                     if mid is None:
                         result.skipped += 1

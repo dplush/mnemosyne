@@ -52,16 +52,33 @@ class WritePolicySnapshot:
     classifier_mode: str
 
 
-_WRITE_POLICY_EXEMPT_KINDS = frozenset({"restore", "system_derived"})
+class _WritePolicyExemption:
+    """Opaque capability for trusted in-process writers.
+
+    Exemptions are identity-based rather than caller-selected strings. Python
+    callers can still pass the legacy ``_write_kind`` keyword, but values such
+    as ``"restore"`` and ``"system_derived"`` no longer grant privileges.
+    """
+
+
+_RESTORE_WRITE_CAPABILITY = _WritePolicyExemption()
+_SYSTEM_DERIVED_WRITE_CAPABILITY = _WritePolicyExemption()
+_WRITE_POLICY_EXEMPT_CAPABILITIES = (
+    _RESTORE_WRITE_CAPABILITY,
+    _SYSTEM_DERIVED_WRITE_CAPABILITY,
+)
 _active_write_policy: ContextVar[Optional[WritePolicySnapshot]] = ContextVar(
     "mnemosyne_write_policy", default=None
 )
 
 
-def is_write_policy_exempt(write_kind: str) -> bool:
-    """Return whether an internal write kind is in the enumerated exemption set."""
+def is_write_policy_exempt(write_kind: object) -> bool:
+    """Return whether ``write_kind`` is a trusted internal capability."""
 
-    return write_kind in _WRITE_POLICY_EXEMPT_KINDS
+    return any(
+        write_kind is capability
+        for capability in _WRITE_POLICY_EXEMPT_CAPABILITIES
+    )
 
 # ---------------------------------------------------------------------------
 # Curated default patterns
@@ -531,7 +548,7 @@ def should_remember(
 def admit_memory_write(
     content: str,
     *,
-    write_kind: str = "public",
+    write_kind: object = "public",
     policy: Optional[WritePolicySnapshot] = None,
 ) -> Tuple[bool, WriteDecision]:
     """Common admission boundary for content-persistence gateways."""
