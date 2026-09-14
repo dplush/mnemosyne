@@ -393,6 +393,79 @@ def test_facade_data_uri_is_admitted_before_blob_or_sql_mutation(
         memory.conn.close()
 
 
+def test_remember_media_data_uri_is_admitted_before_blob_or_sql_mutation(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne.core import filters
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    blob_dir = tmp_path / "media-blobs"
+    monkeypatch.setenv("MNEMOSYNE_BLOB_DIR", str(blob_dir))
+    content = "data:image/png;base64," + base64.b64encode(
+        b"issue 821 media binary"
+    ).decode("ascii")
+    strict = WritePolicySnapshot((r"^data:",), "strict")
+    resolutions = 0
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return strict
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    beam = BeamMemory(session_id="media-data-uri", db_path=tmp_path / "media.db")
+    try:
+        result = beam.remember_media(content)
+        assert result.status == "filtered"
+        assert result.asset_id == ""
+        assert resolutions == 1
+        assert beam.conn.execute("SELECT COUNT(*) FROM media_assets").fetchone()[0] == 0
+        assert beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert not blob_dir.exists()
+    finally:
+        beam.conn.close()
+
+
+def test_remember_media_allowed_data_uri_reuses_operation_snapshot(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne.core import filters
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    blob_dir = tmp_path / "allowed-media-blobs"
+    monkeypatch.setenv("MNEMOSYNE_BLOB_DIR", str(blob_dir))
+    content = "data:image/png;base64," + base64.b64encode(
+        b"allowed issue 821 media binary"
+    ).decode("ascii")
+    allowed = WritePolicySnapshot((), "off")
+    resolutions = 0
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return allowed
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    beam = BeamMemory(
+        session_id="allowed-media-data-uri", db_path=tmp_path / "allowed-media.db"
+    )
+    try:
+        result = beam.remember_media(content)
+        assert result.status == "unavailable"
+        assert resolutions == 1
+        asset = beam.media.get_asset(result.asset_id)
+        assert asset is not None
+        assert asset["ref_value"].startswith("blob://sha256/")
+        assert "anchor_memory_id" in json.loads(asset["metadata"])
+        assert beam.conn.execute("SELECT COUNT(*) FROM media_assets").fetchone()[0] == 1
+        assert beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 1
+        assert any(path.is_file() for path in blob_dir.rglob("*"))
+    finally:
+        beam.conn.close()
+
+
 def test_facade_allowed_data_uri_preserves_blob_extraction(
     tmp_path: Path, monkeypatch
 ):
