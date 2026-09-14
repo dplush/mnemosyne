@@ -104,6 +104,31 @@ def test_update_working_respects_global_cross_session_visibility(temp_db):
     assert writer.get(private_id)["content"] == "private before"
 
 
+def test_update_working_stream_gate_rejects_before_any_write(temp_db):
+    writer = BeamMemory(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    events = []
+    updater = BeamMemory(
+        session_id="session-b", db_path=temp_db, event_emitter=events.append
+    )
+    changes_before = updater.conn.total_changes
+
+    updater.conn.execute("BEGIN")
+    try:
+        with pytest.raises(
+            beam_module.MemoryTransactionStateError,
+            match="commit before updating",
+        ):
+            updater.update_working(memory_id, content="after")
+
+        assert updater.conn.in_transaction is True
+        assert updater.conn.total_changes == changes_before
+        assert updater.get(memory_id)["content"] == "before"
+        assert events == []
+    finally:
+        updater.conn.rollback()
+
+
 def test_mnemosyne_update_reports_success_for_beam_only_global_memory(temp_db):
     writer = BeamMemory(session_id="session-a", db_path=temp_db)
     memory_id = writer.remember("beam only before", source="test", scope="global")
@@ -157,6 +182,34 @@ def test_mnemosyne_update_foreign_private_memory_emits_no_event(temp_db):
     assert updater.update(memory_id, content="private after") is False
     assert writer.get(memory_id)["content"] == "private before"
     assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+
+
+def test_mnemosyne_update_stream_gate_rejects_before_any_write_or_event(temp_db):
+    writer = Mnemosyne(session_id="session-a", db_path=temp_db)
+    memory_id = writer.remember("before", source="test", scope="global")
+    updater = Mnemosyne(session_id="session-b", db_path=temp_db).enable_streaming()
+    changes_before = updater.conn.total_changes
+
+    updater.conn.execute("BEGIN")
+    try:
+        with pytest.raises(
+            beam_module.MemoryTransactionStateError,
+            match="commit before updating",
+        ):
+            updater.update(memory_id, content="after", importance=0.9)
+
+        assert updater.conn.in_transaction is True
+        assert updater.conn.total_changes == changes_before
+        assert tuple(updater.conn.execute(
+            "SELECT content, importance FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()) == ("before", 0.5)
+        assert tuple(updater.conn.execute(
+            "SELECT content, importance FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()) == ("before", 0.5)
+        assert updater.stream.get_buffer(event_types=[EventType.MEMORY_UPDATED]) == []
+    finally:
+        updater.conn.rollback()
 
 
 def test_mnemosyne_update_rolls_back_and_emits_no_event_when_beam_write_fails(

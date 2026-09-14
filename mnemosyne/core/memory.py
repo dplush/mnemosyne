@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 from mnemosyne.core import embeddings as _embeddings
 from mnemosyne.core import beam as beam_module
 from mnemosyne.core._connection_gc import collect_connection_cycles
-from mnemosyne.core.beam import BeamMemory, _BeamConnection, _deferred_commits, init_beam
+from mnemosyne.core.beam import (
+    BeamMemory,
+    MemoryTransactionStateError,
+    _BeamConnection,
+    _deferred_commits,
+    init_beam,
+)
 from mnemosyne.core.journal import journal_mode
 _thread_local = threading.local()
 
@@ -849,6 +855,17 @@ class Mnemosyne:
 
         if not updates:
             return False
+
+        # A caller-owned transaction can roll back after this method returns,
+        # but the wrapper cannot defer MEMORY_UPDATED until that outer commit.
+        # Fail before either mirror is touched when streaming makes the update
+        # observable. Without streaming, the existing savepoint path remains
+        # available to callers and batch adapters.
+        if self._stream is not None and self.conn.in_transaction:
+            raise MemoryTransactionStateError(
+                "Mnemosyne.update(): streaming is active while a caller-owned"
+                " transaction is open; commit before updating."
+            )
 
         with _deferred_commits(self.conn):
             # Authorize from the authoritative BEAM working row. Global rows
