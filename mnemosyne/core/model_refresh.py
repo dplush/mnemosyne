@@ -398,6 +398,7 @@ def apply_model_refresh_proposal(
         metadata["body"],
         source="sleep_model_refresh",
         confidence=coerce_confidence(metadata.get("confidence"), 0.5),
+        _write_kind="system_derived",
     )
     metadata["status"] = "applied"
     metadata["applied_by"] = validator or "system"

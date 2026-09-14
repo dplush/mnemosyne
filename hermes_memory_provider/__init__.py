@@ -1658,18 +1658,23 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if vector_type and vector_type not in ("float32", "int8", "bit"):
             logger.warning("Mnemosyne: unknown vector_type=%r, ignoring", vector_type)
 
-        # ignore_patterns: list of regex patterns to filter from memory storage
-        patterns = kwargs.get("ignore_patterns") or self._read_config_key("ignore_patterns")
-        if patterns:
-            if isinstance(patterns, str):
-                patterns = [p.strip() for p in patterns.replace(",", "\n").split("\n") if p.strip()]
-            elif isinstance(patterns, list):
-                patterns = [str(p).strip() for p in patterns if str(p).strip()]
-            self._ignore_patterns = patterns
-
         # Capture the provider's effective policy without bridging through
         # os.environ. Explicit kwargs and Hermes config keep their precedence.
         from mnemosyne.core.filters import make_write_policy, resolve_write_policy
+        core_policy = resolve_write_policy()
+        patterns = kwargs.get("ignore_patterns")
+        if patterns is None:
+            patterns = read_hermes_config_key(
+                getattr(self, "_hermes_home", None), "ignore_patterns"
+            )
+        if patterns is None:
+            patterns = core_policy.ignore_patterns
+        if isinstance(patterns, str):
+            patterns = [p.strip() for p in patterns.replace(",", "\n").split("\n") if p.strip()]
+        elif isinstance(patterns, (list, tuple)):
+            patterns = [str(p).strip() for p in patterns if str(p).strip()]
+        self._ignore_patterns = patterns
+
         configured_mode = kwargs.get("write_classifier")
         if configured_mode is None:
             configured_mode = read_hermes_config_key(
@@ -1677,7 +1682,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         hermes_mode_explicit = configured_mode is not None
         if configured_mode is None:
-            configured_mode = resolve_write_policy().classifier_mode
+            configured_mode = core_policy.classifier_mode
         if self._ignore_patterns and not hermes_mode_explicit and configured_mode == "off":
             # Provider ignore_patterns historically filtered sync_turn even
             # before write_classifier existed.
@@ -2471,7 +2476,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     stored_user = f"[USER] {uc}"
                     capture = ledger.capture if ledger else None
                     remember = (lambda **kw: capture(ledger_session_id, ticket, self._beam, user_content, **kw)) if capture else self._beam.remember
-                    remember(
+                    user_memory_id = remember(
                         content=stored_user,
                         source="conversation",
                         importance=0.5,
@@ -2479,7 +2484,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         extract_entities=True,
                         _write_policy_content=user_content,
                     )
-                    self._capture_identity_signals(user_content)
+                    if user_memory_id is not None:
+                        self._capture_identity_signals(user_content)
                 if "assistant" in self._sync_roles and assistant_content and len(assistant_content) > 10:
                     assistant_limit = _sync_turn_assistant_limit()
                     ac = assistant_content[:assistant_limit] if assistant_limit > 0 else assistant_content
@@ -3433,6 +3439,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             owner_id, category, name, body,
             source=source, confidence=confidence,
         )
+        if row is None:
+            return json.dumps({"status": "filtered", "store": "canonical"})
         status = row.pop("status", "stored")
         self._audit_event(
             "remember_canonical", bank="canonical",
@@ -3680,12 +3688,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             body = state
             if metadata:
                 body += "\n" + json.dumps(metadata, default=str)
-            store.remember(
+            row = store.remember(
                 owner_id=owner_id,
                 category="task:progress",
                 name=task,
                 body=body,
             )
+            if row is None:
+                return json.dumps({"status": "filtered", "store": "canonical"})
             self._audit_event(
                 "task_progress_set",
                 bank="private",
@@ -3737,6 +3747,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not content:
             return json.dumps({"error": "Content is required"})
         pad_id = self._beam.scratchpad_write(content)
+        if pad_id is None:
+            return json.dumps({"status": "filtered", "store": "scratchpad"})
         return json.dumps({"status": "written", "id": pad_id})
 
     def _handle_scratchpad_read(self, args: Dict[str, Any]) -> str:
@@ -4016,15 +4028,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not self._beam or action not in ("add", "replace"):
             return
         try:
-            scope = "global" if target == "user" else "session"
-            self._beam.remember(
-                content=content,
-                source=f"builtin_memory_{target}",
-                importance=0.7 if target == "user" else 0.5,
-                scope=scope,
-            )
+            from mnemosyne.core.filters import write_policy_operation
+
+            with write_policy_operation(
+                getattr(self, "_write_policy", None)
+            ), self._ensure_beam_access_lock():
+                scope = "global" if target == "user" else "session"
+                self._beam.remember(
+                    content=content,
+                    source=f"builtin_memory_{target}",
+                    importance=0.7 if target == "user" else 0.5,
+                    scope=scope,
+                    _write_policy=getattr(self, "_write_policy", None),
+                )
         except Exception as e:
-            logger.debug("Mnemosyne mirror write failed: %s", e)
+            logger.debug("Mnemosyne mirror write failed: %s", type(e).__name__)
 
     # How long shutdown() will wait for an in-flight session_end consolidation
     # to finish before clearing the host backend. Bounded so shutdown is never

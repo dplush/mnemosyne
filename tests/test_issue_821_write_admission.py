@@ -82,7 +82,7 @@ import os
 import sys
 import types
 from pathlib import Path
-from mnemosyne.core.filters import WritePolicySnapshot
+from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
 
 hermes_constants = types.ModuleType("hermes_constants")
 hermes_constants.get_hermes_home = lambda: Path(os.environ["HERMES_HOME"])
@@ -99,9 +99,17 @@ init_kwargs = {
 }
 if os.environ["POLICY_SOURCE"] == "initialize":
     init_kwargs.update(ignore_patterns=[r"^ISSUE821"], write_classifier="strict")
+elif os.environ["POLICY_SOURCE"] == "initialize_empty_list":
+    init_kwargs.update(ignore_patterns=[], write_classifier="off")
+elif os.environ["POLICY_SOURCE"] == "initialize_empty_string":
+    init_kwargs.update(ignore_patterns="", write_classifier="off")
 provider.initialize("issue-821", **init_kwargs)
 assert provider._beam is not None
-marker = "ISSUE821 private gateway sentinel"
+marker = (
+    "ISSUE821 I feel like a private gateway sentinel"
+    if os.environ["GATEWAY"] == "sync_identity"
+    else "ISSUE821 private gateway sentinel"
+)
 response = None
 original = None
 validate_compatibility = None
@@ -147,15 +155,45 @@ elif os.environ["GATEWAY"] in {"update", "validate_update"}:
             "attest_status": attest.get("status"),
         }
     original = provider._beam.get(memory_id)["content"]
+elif os.environ["GATEWAY"] == "sync_identity":
+    provider.sync_turn(marker, "", session_id="issue-821")
+    response = json.dumps(provider._sync_turn_diagnostics())
+elif os.environ["GATEWAY"] in {"on_memory_add", "on_memory_replace"}:
+    provider.on_memory_write(os.environ["GATEWAY"].removeprefix("on_memory_"), "user", marker)
+elif os.environ["GATEWAY"] in {"canonical_create", "canonical_update"}:
+    if os.environ["GATEWAY"] == "canonical_update":
+        with write_policy_operation(WritePolicySnapshot((), "off")):
+            provider._beam.canonical.remember("default", "identity", "slot", "allowed original")
+    response = provider.handle_tool_call(
+        "mnemosyne_remember_canonical",
+        {"category": "identity", "name": "slot", "body": marker},
+    )
+    current = provider._beam.canonical.recall("default", "identity", "slot")
+    original = current["body"] if current else None
+elif os.environ["GATEWAY"] == "task_progress":
+    response = provider.handle_tool_call(
+        "mnemosyne_task_progress", {"action": "set", "task": "gate", "state": marker}
+    )
+elif os.environ["GATEWAY"] == "scratchpad":
+    response = provider.handle_tool_call("mnemosyne_scratchpad_write", {"content": marker})
 else:
     raise AssertionError(os.environ["GATEWAY"])
 beams = [provider._beam]
 if provider._surface_beam is not None:
     beams.append(provider._surface_beam)
-count = sum(
-    beam.conn.execute("SELECT COUNT(*) FROM working_memory WHERE content LIKE ?", ("%ISSUE821%",)).fetchone()[0]
-    for beam in beams
-)
+count = 0
+for beam in beams:
+    for table_row in beam.conn.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+        table = table_row[0]
+        quoted_table = '"' + table.replace('"', '""') + '"'
+        for column in beam.conn.execute(f"PRAGMA table_info({quoted_table})"):
+            if "TEXT" not in str(column[2]).upper():
+                continue
+            quoted_column = '"' + column[1].replace('"', '""') + '"'
+            count += beam.conn.execute(
+                f"SELECT COUNT(*) FROM {quoted_table} WHERE {quoted_column} LIKE ?",
+                ("%ISSUE821%",),
+            ).fetchone()[0]
 print(json.dumps({
     "count": count,
     "original": original,
@@ -171,7 +209,11 @@ print(json.dumps({
 @pytest.mark.parametrize("provider_module", ["hermes_memory_provider", "mnemosyne_hermes"])
 @pytest.mark.parametrize(
     "gateway",
-    ["remember", "pending_apply", "shared_remember", "batch", "update", "validate_update"],
+    [
+        "remember", "pending_apply", "shared_remember", "batch", "update",
+        "validate_update", "sync_identity", "on_memory_add", "on_memory_replace",
+        "canonical_create", "canonical_update", "task_progress", "scratchpad",
+    ],
 )
 @pytest.mark.parametrize("policy_source", ["initialize", "hermes"])
 def test_every_provider_gateway_honors_provider_policy_over_conflicting_env(
@@ -207,8 +249,12 @@ def test_every_provider_gateway_honors_provider_policy_over_conflicting_env(
     assert payload["mode"] == "strict"
     assert payload["patterns"] == ["^ISSUE821"]
     assert payload["same_env"] is True
-    if gateway in {"update", "validate_update"}:
+    if gateway in {"update", "validate_update", "canonical_update"}:
         assert payload["original"] == "allowed original"
+    if gateway in {"canonical_create", "canonical_update", "task_progress"}:
+        assert payload["response"] == {"status": "filtered", "store": "canonical"}
+    if gateway == "scratchpad":
+        assert payload["response"] == {"status": "filtered", "store": "scratchpad"}
     if gateway == "validate_update":
         assert payload["response"]["status"] == "filtered"
         assert set(payload["response"]) <= {"status", "memory_id", "store", "bank"}
@@ -219,6 +265,93 @@ def test_every_provider_gateway_honors_provider_policy_over_conflicting_env(
         }
     assert "ISSUE821 private gateway sentinel" not in result.stderr
     assert "ISSUE821 private gateway sentinel" not in result.stdout
+    if gateway == "sync_identity":
+        identity_marker = "ISSUE821 I feel like a private gateway sentinel"
+        assert identity_marker not in result.stderr
+        assert identity_marker not in result.stdout
+
+
+@pytest.mark.parametrize("provider_module", ["hermes_memory_provider", "mnemosyne_hermes"])
+@pytest.mark.parametrize(
+    "policy_source", ["initialize_empty_list", "initialize_empty_string", "hermes_empty"]
+)
+def test_empty_provider_patterns_override_conflicting_core_env(
+    tmp_path: Path, provider_module: str, policy_source: str
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    if policy_source == "hermes_empty":
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n  mnemosyne:\n    write_classifier: off\n    ignore_patterns: []\n"
+        )
+    result = _run(
+        _GATEWAY_SCRIPT,
+        env={
+            "GATEWAY": "remember",
+            "POLICY_SOURCE": policy_source,
+            "PROVIDER_MODULE": provider_module,
+            "HERMES_HOME": str(hermes_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+            "MNEMOSYNE_WRITE_CLASSIFIER": "off",
+            "MNEMOSYNE_IGNORE_PATTERNS": "^ISSUE821",
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "MNEMOSYNE_HOST_LLM_ENABLED": "0",
+            "SHARED_DB": str(tmp_path / "shared.db"),
+        },
+    )
+    payload = json.loads(result.stdout)
+    assert payload["count"] >= 1
+    assert payload["patterns"] == []
+    assert payload["response"]["status"] == "stored"
+
+
+def test_direct_core_and_mcp_canonical_and_scratchpad_rejections_are_atomic(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne import mcp_tools
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.canonical import CanonicalStore
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.memory import Mnemosyne
+
+    marker = "ISSUE821 private direct sentinel"
+    strict = WritePolicySnapshot(("^ISSUE821",), "strict")
+
+    beam = BeamMemory(session_id="core", db_path=tmp_path / "core.db")
+    store = CanonicalStore(db_path=beam.db_path, conn=beam.conn)
+    store.remember("owner", "identity", "existing", "allowed original")
+    with write_policy_operation(strict):
+        assert store.remember("owner", "identity", "new", marker) is None
+        assert store.remember("owner", "identity", "existing", marker) is None
+        assert beam.scratchpad_write(marker) is None
+    assert store.recall("owner", "identity", "new") is None
+    assert store.recall("owner", "identity", "existing")["body"] == "allowed original"
+    assert beam.scratchpad_read() == []
+
+    memory = Mnemosyne(session_id="mcp", db_path=tmp_path / "mcp.db")
+    memory.beam.canonical.remember("default", "identity", "existing", "allowed original")
+    monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: memory)
+    with write_policy_operation(strict):
+        responses = [
+            mcp_tools.handle_tool_call("mnemosyne_remember_canonical", {
+                "category": "identity", "name": "new", "body": marker,
+            }),
+            mcp_tools.handle_tool_call("mnemosyne_remember_canonical", {
+                "category": "identity", "name": "existing", "body": marker,
+            }),
+            mcp_tools.handle_tool_call("mnemosyne_scratchpad_write", {"content": marker}),
+        ]
+    assert responses == [
+        {"status": "filtered", "store": "canonical"},
+        {"status": "filtered", "store": "canonical"},
+        {"status": "filtered", "store": "scratchpad"},
+    ]
+    assert marker not in json.dumps(responses)
+    assert memory.beam.canonical.recall("default", "identity", "new") is None
+    assert memory.beam.canonical.recall("default", "identity", "existing")["body"] == "allowed original"
+    assert memory.scratchpad_read() == []
 
 
 def test_only_restore_and_system_derived_writes_are_exempt():

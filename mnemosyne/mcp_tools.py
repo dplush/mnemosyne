@@ -841,6 +841,8 @@ def _handle_remember_canonical(arguments: Dict[str, Any]) -> Dict[str, Any]:
         source=arguments.get("source", "canonical_tool"),
         confidence=arguments.get("confidence", 1.0),
     )
+    if row is None:
+        return {"status": "filtered", "store": "canonical"}
     status = row.pop("status", "stored")
     return {"status": status, "owner_id": owner_id, "category": category,
             "name": name, "version": row.get("version"), "store": "canonical"}
@@ -940,6 +942,8 @@ def _handle_scratchpad_write(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     entry_id = mem.scratchpad_write(content)
+    if entry_id is None:
+        return {"status": "filtered", "store": "scratchpad"}
     return {"status": "written", "id": entry_id}
 
 

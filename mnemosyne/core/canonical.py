@@ -201,7 +201,8 @@ class CanonicalStore:
         body: str,
         source: str = "",
         confidence: float = 1.0,
-    ) -> Dict:
+        _write_kind: str = "public",
+    ) -> Optional[Dict]:
         """Upsert the canonical value for ``(owner_id, category, name)``.
 
         - If the slot is empty, insert version 1.
@@ -221,6 +222,11 @@ class CanonicalStore:
             raise ValueError("owner_id, category, and name are required")
         if not body or not body.strip():
             raise ValueError("body is required and cannot be blank")
+
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(body, write_kind=_write_kind)[0]:
+            return None
 
         cursor = self.conn.cursor()
         # BEGIN IMMEDIATE so the read-current + supersede + insert sequence is
@@ -581,7 +587,7 @@ def remember_canonical(
     source: str = "",
     confidence: float = 1.0,
     db_path: Optional[Path] = None,
-) -> Dict:
+) -> Optional[Dict]:
     """Upsert a canonical fact without instantiating CanonicalStore manually."""
     store = CanonicalStore(db_path=db_path)
     return store.remember(owner_id, category, name, body,

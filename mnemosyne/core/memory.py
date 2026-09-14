@@ -907,7 +907,7 @@ class Mnemosyne:
             limit=limit,
         )
 
-    def scratchpad_write(self, content: str) -> str:
+    def scratchpad_write(self, content: str) -> Optional[str]:
         """Write to scratchpad."""
         return self.beam.scratchpad_write(content)
 
@@ -1424,7 +1424,7 @@ def reclaim_orphans(dry_run: bool = False, stale_after_seconds: int = 3600,
     )
 
 
-def scratchpad_write(content: str, bank: str = None) -> str:
+def scratchpad_write(content: str, bank: str = None) -> Optional[str]:
     """Write to scratchpad using the global instance"""
     return _get_default(bank).scratchpad_write(content)
 

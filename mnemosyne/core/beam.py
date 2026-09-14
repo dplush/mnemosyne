@@ -10528,7 +10528,11 @@ class BeamMemory:
     # ------------------------------------------------------------------
     # Scratchpad
     # ------------------------------------------------------------------
-    def scratchpad_write(self, content: str) -> str:
+    def scratchpad_write(self, content: str) -> Optional[str]:
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(content)[0]:
+            return None
         pad_id = _generate_id(content)
         ts = datetime.now().isoformat()
         self.conn.execute("""
