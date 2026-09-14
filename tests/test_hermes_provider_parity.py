@@ -708,6 +708,7 @@ class _FakeBeam:
 
     def remember(self, **kwargs):
         self.calls.append(kwargs)
+        return "fake-memory-id"
 
 
 def _new_provider(module, *, scope="session", roles=("user", "assistant")):

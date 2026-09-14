@@ -5141,7 +5141,9 @@ class BeamMemory:
                  veracity: str = "unknown",
                  trust_tier: str = None,
                  memory_type: str = None,
-                 dedupe: bool = True) -> str:
+                 dedupe: bool = True,
+                 _write_kind: str = "public",
+                 _write_policy=None) -> str:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -5187,6 +5189,15 @@ class BeamMemory:
                 dedup-update path applies memory_type via COALESCE, so an
                 explicit type on a colliding write retypes the existing row.
         """
+        # This is the common policy boundary for every public content gateway.
+        # It runs before sanitization, deduplication, blob writes, or SQL.
+        from mnemosyne.core.filters import admit_memory_write
+        should_write, _decision = admit_memory_write(
+            content, write_kind=_write_kind, policy=_write_policy
+        )
+        if not should_write:
+            return None  # type: ignore[return-value]
+
         # Clamp veracity at the BeamMemory.remember entry too -- the
         # method is the lowest-level public ingest path under BeamMemory,
         # so consistency with remember_batch and the provider
@@ -5493,6 +5504,19 @@ class BeamMemory:
         BEAM benchmark's 250k-message ingest, ~minutes. Documented in
         CHANGELOG.
         """
+        from mnemosyne.core.filters import admit_memory_write, current_write_policy
+        policy = current_write_policy()
+        admitted_items = []
+        for item in items:
+            should_write, _decision = admit_memory_write(
+                item["content"], policy=policy
+            )
+            if should_write:
+                admitted_items.append(item)
+        items = admitted_items
+        if not items:
+            return []
+
         cursor = self.conn.cursor()
         ids = []
         # Carry per-row source + veracity through to enrichment so we

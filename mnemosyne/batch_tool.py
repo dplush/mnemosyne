@@ -132,7 +132,8 @@ def apply_beam_batch(
     audit_events: list[tuple[str, dict[str, Any]]] = []
     current = {"index": None, "action": None}
     try:
-        with _deferred_commits(beam.conn):
+        from mnemosyne.core.filters import write_policy_operation
+        with write_policy_operation(), _deferred_commits(beam.conn):
             for current in normalized:
                 results.append(_apply_one(
                     beam,
@@ -201,6 +202,8 @@ def _apply_one(
             metadata=metadata,
             veracity=veracity,
         )
+        if memory_id is None:
+            return {"index": index, "action": action, "status": "filtered"}
         audit_events.append((
             "remember",
             {"memory_id": memory_id, "bank": "private", "scope": scope, "source_tool": remember_source_tool},

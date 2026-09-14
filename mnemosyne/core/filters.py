@@ -19,7 +19,7 @@ For v1 this is deterministic only — no LLM calls.  The ``classify_memory_write
 function returns a structured ``WriteDecision`` that callers inspect before
 persisting.
 
-Config is read from env vars (mirroring the pattern in ``beam.py``):
+Config is resolved through the central runtime config reader:
 
 - ``MNEMOSYNE_IGNORE_PATTERNS`` — newline- or comma-separated regex patterns
 - ``MNEMOSYNE_WRITE_CLASSIFIER`` — ``off`` (default), ``warn``, or ``strict``
@@ -34,10 +34,34 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
+
+from mnemosyne.core.config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WritePolicySnapshot:
+    """Immutable write policy resolved from one config generation."""
+
+    ignore_patterns: Tuple[str, ...]
+    classifier_mode: str
+
+
+_WRITE_POLICY_EXEMPT_KINDS = frozenset({"restore", "system_derived"})
+_active_write_policy: ContextVar[Optional[WritePolicySnapshot]] = ContextVar(
+    "mnemosyne_write_policy", default=None
+)
+
+
+def is_write_policy_exempt(write_kind: str) -> bool:
+    """Return whether an internal write kind is in the enumerated exemption set."""
+
+    return write_kind in _WRITE_POLICY_EXEMPT_KINDS
 
 # ---------------------------------------------------------------------------
 # Curated default patterns
@@ -276,6 +300,52 @@ def _load_classifier_mode() -> str:
     return mode
 
 
+def _normalize_classifier_mode(raw: object) -> str:
+    mode = str(raw or "off").strip().lower()
+    if mode not in ("off", "warn", "strict"):
+        logger.warning("Unknown write classifier mode; defaulting to 'off'")
+        return "off"
+    return mode
+
+
+def _coerce_patterns(raw: object) -> Tuple[str, ...]:
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(pattern).strip() for pattern in raw if str(pattern).strip())
+    return tuple(_parse_patterns(str(raw or "")))
+
+
+def resolve_write_policy() -> WritePolicySnapshot:
+    """Resolve ``config.yaml > env > default`` exactly once."""
+    values = get_config().get_many({
+        "ignore_patterns": "",
+        "write_classifier": "off",
+    })
+    return WritePolicySnapshot(
+        ignore_patterns=_coerce_patterns(values["ignore_patterns"]),
+        classifier_mode=_normalize_classifier_mode(values["write_classifier"]),
+    )
+
+
+def current_write_policy() -> WritePolicySnapshot:
+    """Return the enclosing operation snapshot, or resolve a new one."""
+    return _active_write_policy.get() or resolve_write_policy()
+
+
+@contextmanager
+def write_policy_operation() -> Iterator[WritePolicySnapshot]:
+    """Keep all writes in one public operation on one policy snapshot."""
+    existing = _active_write_policy.get()
+    if existing is not None:
+        yield existing
+        return
+    snapshot = resolve_write_policy()
+    token = _active_write_policy.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _active_write_policy.reset(token)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -444,3 +514,20 @@ def should_remember(
         return True, decision
 
     return True, decision
+
+
+def admit_memory_write(
+    content: str,
+    *,
+    write_kind: str = "public",
+    policy: Optional[WritePolicySnapshot] = None,
+) -> Tuple[bool, WriteDecision]:
+    """Common admission boundary for content-persistence gateways."""
+    if is_write_policy_exempt(write_kind):
+        return True, WriteDecision(action="allow", target="memory")
+    snapshot = policy or current_write_policy()
+    return should_remember(
+        content,
+        ignore_patterns=list(snapshot.ignore_patterns),
+        classifier_mode=snapshot.classifier_mode,
+    )

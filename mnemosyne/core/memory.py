@@ -566,17 +566,6 @@ class Mnemosyne:
         write and control its id -- media ingest, importers -- should call
         BeamMemory.remember directly rather than going through here.
         """
-        # --- Core-level write filter (issues #406, #428) ---
-        # Placed here so ALL entry points (Hermes provider, MCP server, SDK,
-        # CLI) benefit, not just the Hermes plugin layer.  The provider's
-        # own _should_filter remains as an additional pre-filter for
-        # conversation sync; this is the catch-all at the root.
-        from mnemosyne.core.filters import should_remember
-        should_write, _decision = should_remember(content)
-        if not should_write:
-            logger.debug("Memory write filtered: %s", _decision.reason)
-            return None
-
         # BEAM write first (generates its own ID). Extract flags are passed
         # through so BeamMemory's canonical _extract_and_store_entities and
         # _extract_and_store_facts helpers run — these populate the `facts`
@@ -620,6 +609,8 @@ class Mnemosyne:
                 memory_type=memory_type,
                 dedupe=dedupe,
             )
+            if memory_id is None:
+                return None  # type: ignore[return-value]
             timestamp = datetime.now().isoformat()
 
             # Legacy dual-write with same ID (INSERT OR REPLACE for dedup safety)
