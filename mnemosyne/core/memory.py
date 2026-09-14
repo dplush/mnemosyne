@@ -829,9 +829,9 @@ class Mnemosyne:
         """Update an existing memory in legacy table and BEAM."""
         policy = None
         if content is not None:
-            from mnemosyne.core.filters import admit_memory_write, resolve_write_policy
+            from mnemosyne.core.filters import admit_memory_write, current_write_policy
 
-            policy = resolve_write_policy()
+            policy = current_write_policy()
             if not admit_memory_write(content, policy=policy)[0]:
                 return None  # type: ignore[return-value]
 

@@ -2103,28 +2103,31 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if tool_name == "mnemosyne_sleep" and self._reflect_disabled_for_cron and (self._agent_context or "").strip().lower() == "cron":
             return json.dumps(self._reflection_skip_response("reflect_disabled_for_cron", "tool"))
         try:
-            self._maybe_retry_init()
-            self._ensure_initialized_for_tools()
-            # Tools use the durable session selected by on_session_switch().
-            # Hold the same session lock for the complete dispatch so a write,
-            # recall, or sleep cannot be re-attributed mid-operation.
-            with self._beam_session_scope("") as beam:
-                if beam is None:
-                    # C27: structured response carries the actual failure reason
-                    # instead of a generic "not initialized" string. Status field
-                    # is parseable by tool consumers; `reason` is human-readable for
-                    # the agent to relay to the user. The `error` field is kept
-                    # alongside `status` so callers using the prior "if 'error' in
-                    # payload" pattern (codex review finding #4) don't silently
-                    # misclassify unavailable as success.
-                    reason = self._init_error_reason()
-                    return json.dumps({
-                        "status": "memory_unavailable",
-                        "tool": tool_name,
-                        "reason": reason,
-                        "error": f"Mnemosyne unavailable: {reason}",
-                    })
-                return self._dispatch_tool_call_locked(tool_name, args)
+            from mnemosyne.core.filters import write_policy_operation
+
+            with write_policy_operation(getattr(self, "_write_policy", None)):
+                self._maybe_retry_init()
+                self._ensure_initialized_for_tools()
+                # Tools use the durable session selected by on_session_switch().
+                # Hold the same session lock for the complete dispatch so a write,
+                # recall, or sleep cannot be re-attributed mid-operation.
+                with self._beam_session_scope("") as beam:
+                    if beam is None:
+                        # C27: structured response carries the actual failure reason
+                        # instead of a generic "not initialized" string. Status field
+                        # is parseable by tool consumers; `reason` is human-readable for
+                        # the agent to relay to the user. The `error` field is kept
+                        # alongside `status` so callers using the prior "if 'error' in
+                        # payload" pattern (codex review finding #4) don't silently
+                        # misclassify unavailable as success.
+                        reason = self._init_error_reason()
+                        return json.dumps({
+                            "status": "memory_unavailable",
+                            "tool": tool_name,
+                            "reason": reason,
+                            "error": f"Mnemosyne unavailable: {reason}",
+                        })
+                    return self._dispatch_tool_call_locked(tool_name, args)
         except Exception as e:
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})
@@ -2299,6 +2302,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             extract=extract,
             metadata=metadata,
             veracity=veracity,
+            _write_policy=getattr(self, "_write_policy", None),
         )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
@@ -2356,6 +2360,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             remember_source_tool="mnemosyne_batch",
             audit_event=self._audit_event,
             extract_defaults_global=False,
+            write_policy=getattr(self, "_write_policy", None),
         ))
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
@@ -2523,6 +2528,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             scope="global",
             memory_id=stable_id,
             veracity=veracity,
+            _write_policy=getattr(self, "_write_policy", None),
+            _write_policy_content=content,
         )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
@@ -2646,6 +2653,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": f"unknown store: {store}"})
         if action == "update" and not new_content:
             return json.dumps({"error": "new_content is required for action='update'"})
+        if action == "update":
+            from mnemosyne.core.filters import admit_memory_write
+
+            if not admit_memory_write(
+                new_content, policy=getattr(self, "_write_policy", None)
+            )[0]:
+                return json.dumps({
+                    "status": "filtered",
+                    "memory_id": memory_id,
+                    "store": store,
+                    "bank": bank,
+                })
 
         # Pick the right beam (private vs surface)
         if store == "surface":
@@ -2953,9 +2972,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _handle_apply_pending(self, args: Dict[str, Any]) -> str:
         from hermes_constants import get_hermes_home
-        from mnemosyne.core.filters import resolve_write_policy
         from mnemosyne.core.veracity_consolidation import clamp_veracity
-        policy = resolve_write_policy()
+        policy = getattr(self, "_write_policy", None)
         pending_ids = args.get("pending_ids") or []
         if isinstance(pending_ids, str):
             pending_ids = [pid.strip() for pid in pending_ids.split(",") if pid.strip()]
@@ -3086,7 +3104,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         content = args.get("content")
         importance = args.get("importance")
-        ok = self._beam.update_working(memory_id, content=content, importance=importance)
+        ok = self._beam.update_working(
+            memory_id,
+            content=content,
+            importance=importance,
+            _write_policy=getattr(self, "_write_policy", None),
+        )
         if ok is None:
             return json.dumps({"status": "filtered", "memory_id": memory_id})
         return json.dumps({

@@ -2653,6 +2653,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         return self._configured_tool_schemas()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        from mnemosyne.core.filters import write_policy_operation
+
+        with write_policy_operation(getattr(self, "_write_policy", None)):
+            return self._dispatch_tool_call(tool_name, args, **kwargs)
+
+    def _dispatch_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         try:
             if not self.has_tool(tool_name):
                 return json.dumps({"error": f"Unknown Mnemosyne tool: {tool_name}"})
@@ -2852,6 +2858,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             extract=extract,
             metadata=metadata,
             veracity=veracity,
+            _write_policy=getattr(self, "_write_policy", None),
         )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
@@ -2908,6 +2915,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             remember_source_tool="mnemosyne_batch",
             audit_event=self._audit_event,
             extract_defaults_global=False,
+            write_policy=getattr(self, "_write_policy", None),
         ))
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
@@ -3056,6 +3064,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             scope="global",
             memory_id=stable_id,
             veracity=veracity,
+            _write_policy=getattr(self, "_write_policy", None),
+            _write_policy_content=content,
         )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
@@ -3179,6 +3189,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": f"unknown store: {store}"})
         if action == "update" and not new_content:
             return json.dumps({"error": "new_content is required for action='update'"})
+        if action == "update":
+            from mnemosyne.core.filters import admit_memory_write
+
+            if not admit_memory_write(
+                new_content, policy=getattr(self, "_write_policy", None)
+            )[0]:
+                return json.dumps({
+                    "status": "filtered",
+                    "memory_id": memory_id,
+                    "store": store,
+                    "bank": bank,
+                })
 
         # Pick the right beam (private vs surface)
         if store == "surface":
@@ -3503,10 +3525,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         gate so approved records are committed without re-staging.
         """
         from hermes_constants import get_hermes_home
-        from mnemosyne.core.filters import resolve_write_policy
         from mnemosyne.core.veracity_consolidation import clamp_veracity
 
-        policy = resolve_write_policy()
+        policy = getattr(self, "_write_policy", None)
 
         pending_ids = args.get("pending_ids") or []
         if isinstance(pending_ids, str):
@@ -3741,7 +3762,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "memory_id is required"})
         content = args.get("content")
         importance = args.get("importance")
-        ok = self._beam.update_working(memory_id, content=content, importance=importance)
+        ok = self._beam.update_working(
+            memory_id,
+            content=content,
+            importance=importance,
+            _write_policy=getattr(self, "_write_policy", None),
+        )
         if ok is None:
             return json.dumps({"status": "filtered", "memory_id": memory_id})
         return json.dumps({

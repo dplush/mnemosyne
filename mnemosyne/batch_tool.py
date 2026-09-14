@@ -127,13 +127,14 @@ def apply_beam_batch(
     remember_source_tool: str = "mnemosyne_batch",
     audit_event: Callable[..., Any] | None = None,
     extract_defaults_global: bool = False,
+    write_policy: Any = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     audit_events: list[tuple[str, dict[str, Any]]] = []
     current = {"index": None, "action": None}
     try:
         from mnemosyne.core.filters import write_policy_operation
-        with write_policy_operation(), _deferred_commits(beam.conn):
+        with write_policy_operation(write_policy), _deferred_commits(beam.conn):
             for current in normalized:
                 results.append(_apply_one(
                     beam,

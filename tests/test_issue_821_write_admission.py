@@ -82,6 +82,7 @@ import os
 import sys
 import types
 from pathlib import Path
+from mnemosyne.core.filters import WritePolicySnapshot
 
 hermes_constants = types.ModuleType("hermes_constants")
 hermes_constants.get_hermes_home = lambda: Path(os.environ["HERMES_HOME"])
@@ -90,22 +91,26 @@ sys.modules.setdefault("hermes_constants", hermes_constants)
 module = importlib.import_module(os.environ["PROVIDER_MODULE"])
 Provider = module.MnemosyneMemoryProvider
 provider = Provider()
-provider.initialize(
-    "issue-821",
-    hermes_home=os.environ["HERMES_HOME"],
-    shared_surface_path=os.environ["SHARED_DB"],
-)
+policy_env = ("MNEMOSYNE_IGNORE_PATTERNS", "MNEMOSYNE_WRITE_CLASSIFIER")
+env_before = {key: os.environ.get(key) for key in policy_env}
+init_kwargs = {
+    "hermes_home": os.environ["HERMES_HOME"],
+    "shared_surface_path": os.environ["SHARED_DB"],
+}
+if os.environ["POLICY_SOURCE"] == "initialize":
+    init_kwargs.update(ignore_patterns=[r"^ISSUE821"], write_classifier="strict")
+provider.initialize("issue-821", **init_kwargs)
 assert provider._beam is not None
 marker = "ISSUE821 private gateway sentinel"
 response = None
-if os.environ["GATEWAY"] == "sync_turn":
-    provider.sync_turn(marker, "acknowledged response")
-elif os.environ["GATEWAY"] == "tool":
+original = None
+validate_compatibility = None
+if os.environ["GATEWAY"] == "remember":
     response = provider.handle_tool_call("mnemosyne_remember", {"content": marker})
 elif os.environ["GATEWAY"] == "pending_apply":
     pending_id = module._stage_pending_write({"tool": "mnemosyne_remember", "content": marker})
     response = provider.handle_tool_call("mnemosyne_apply_pending", {"pending_ids": [pending_id]})
-elif os.environ["GATEWAY"] == "shared_surface":
+elif os.environ["GATEWAY"] == "shared_remember":
     response = provider.handle_tool_call(
         "mnemosyne_shared_remember", {"content": marker, "kind": "meta"}
     )
@@ -114,34 +119,78 @@ elif os.environ["GATEWAY"] == "batch":
         "mnemosyne_batch",
         {"operations": [{"action": "remember", "content": marker}]},
     )
+elif os.environ["GATEWAY"] in {"update", "validate_update"}:
+    memory_id = provider._beam.remember(
+        "allowed original", _write_policy=WritePolicySnapshot((), "off")
+    )
+    if os.environ["GATEWAY"] == "update":
+        response = provider.handle_tool_call(
+            "mnemosyne_update", {"memory_id": memory_id, "content": marker}
+        )
+    else:
+        response = provider.handle_tool_call(
+            "mnemosyne_validate",
+            {"memory_id": memory_id, "action": "update", "new_content": marker},
+        )
+        validation_rows_after_reject = provider._beam.conn.execute(
+            "SELECT COUNT(*) FROM memory_validations WHERE memory_id = ?", (memory_id,)
+        ).fetchone()[0]
+        no_content = json.loads(provider.handle_tool_call(
+            "mnemosyne_validate", {"memory_id": memory_id, "action": "update"}
+        ))
+        attest = json.loads(provider.handle_tool_call(
+            "mnemosyne_validate", {"memory_id": memory_id, "action": "attest"}
+        ))
+        validate_compatibility = {
+            "validation_rows_after_reject": validation_rows_after_reject,
+            "no_content_error": no_content.get("error"),
+            "attest_status": attest.get("status"),
+        }
+    original = provider._beam.get(memory_id)["content"]
 else:
     raise AssertionError(os.environ["GATEWAY"])
-beam = provider._surface_beam if os.environ["GATEWAY"] == "shared_surface" else provider._beam
-count = beam.conn.execute(
-    "SELECT COUNT(*) FROM working_memory WHERE content LIKE ?", ("%ISSUE821%",)
-).fetchone()[0]
-print(json.dumps({"count": count, "response": json.loads(response) if response else None}))
+beams = [provider._beam]
+if provider._surface_beam is not None:
+    beams.append(provider._surface_beam)
+count = sum(
+    beam.conn.execute("SELECT COUNT(*) FROM working_memory WHERE content LIKE ?", ("%ISSUE821%",)).fetchone()[0]
+    for beam in beams
+)
+print(json.dumps({
+    "count": count,
+    "original": original,
+    "response": json.loads(response) if response else None,
+    "validate_compatibility": validate_compatibility,
+    "mode": provider._write_policy.classifier_mode,
+    "patterns": provider._write_policy.ignore_patterns,
+    "same_env": env_before == {key: os.environ.get(key) for key in policy_env},
+}))
 """
 
 
 @pytest.mark.parametrize("provider_module", ["hermes_memory_provider", "mnemosyne_hermes"])
 @pytest.mark.parametrize(
-    "gateway", ["sync_turn", "tool", "pending_apply", "shared_surface", "batch"]
+    "gateway",
+    ["remember", "pending_apply", "shared_remember", "batch", "update", "validate_update"],
 )
-def test_every_provider_gateway_honors_yaml_strict_over_conflicting_env(
-    tmp_path: Path, gateway: str, provider_module: str
+@pytest.mark.parametrize("policy_source", ["initialize", "hermes"])
+def test_every_provider_gateway_honors_provider_policy_over_conflicting_env(
+    tmp_path: Path, gateway: str, provider_module: str, policy_source: str
 ):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "config.yaml").write_text(
-        "write_classifier: strict\nignore_patterns: ISSUE821\n"
-    )
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
+    if policy_source == "hermes":
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n  mnemosyne:\n    write_classifier: strict\n"
+            "    ignore_patterns: ['^ISSUE821']\n"
+        )
     result = _run(
         _GATEWAY_SCRIPT,
         env={
             "GATEWAY": gateway,
+            "POLICY_SOURCE": policy_source,
             "PROVIDER_MODULE": provider_module,
             "HERMES_HOME": str(hermes_home),
             "MNEMOSYNE_DATA_DIR": str(data_dir),
@@ -150,12 +199,26 @@ def test_every_provider_gateway_honors_yaml_strict_over_conflicting_env(
             "MNEMOSYNE_NO_EMBEDDINGS": "1",
             "MNEMOSYNE_HOST_LLM_ENABLED": "0",
             "SHARED_DB": str(tmp_path / "shared.db"),
+            "SECRET": "ISSUE821 private gateway sentinel",
         },
     )
     payload = json.loads(result.stdout)
     assert payload["count"] == 0
-    assert "ISSUE821" not in result.stderr
-    assert "ISSUE821" not in result.stdout
+    assert payload["mode"] == "strict"
+    assert payload["patterns"] == ["^ISSUE821"]
+    assert payload["same_env"] is True
+    if gateway in {"update", "validate_update"}:
+        assert payload["original"] == "allowed original"
+    if gateway == "validate_update":
+        assert payload["response"]["status"] == "filtered"
+        assert set(payload["response"]) <= {"status", "memory_id", "store", "bank"}
+        assert payload["validate_compatibility"] == {
+            "validation_rows_after_reject": 0,
+            "no_content_error": "new_content is required for action='update'",
+            "attest_status": "validation_attest",
+        }
+    assert "ISSUE821 private gateway sentinel" not in result.stderr
+    assert "ISSUE821 private gateway sentinel" not in result.stdout
 
 
 def test_only_restore_and_system_derived_writes_are_exempt():
@@ -170,9 +233,11 @@ def test_only_restore_and_system_derived_writes_are_exempt():
     )[0] is True
 
 
-def test_batch_uses_one_immutable_policy_snapshot(tmp_path: Path, monkeypatch):
-    from mnemosyne.batch_tool import apply_beam_batch, validate_batch_operations
-    from mnemosyne.core.beam import BeamMemory
+def test_direct_mcp_batch_updates_use_one_immutable_policy_snapshot(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne import mcp_tools
+    from mnemosyne.core.memory import Mnemosyne
 
     class ChangingConfig:
         calls = 0
@@ -184,18 +249,20 @@ def test_batch_uses_one_immutable_policy_snapshot(tmp_path: Path, monkeypatch):
             return {"ignore_patterns": "ISSUE821", "write_classifier": "strict"}
 
     config = ChangingConfig()
-    monkeypatch.setattr("mnemosyne.core.filters.get_config", lambda: config)
-    beam = BeamMemory(session_id="issue-821", db_path=tmp_path / "batch.db")
+    memory = Mnemosyne(session_id="mcp_default", db_path=tmp_path / "batch.db")
     try:
-        operations = validate_batch_operations(
-            [
-                {"action": "remember", "content": "ISSUE821 first"},
-                {"action": "remember", "content": "ISSUE821 second"},
-            ]
-        )
-        result = apply_beam_batch(beam, operations)
+        first = memory.remember("allowed first")
+        second = memory.remember("allowed second")
+        assert first is not None and second is not None
+        monkeypatch.setattr("mnemosyne.core.filters.get_config", lambda: config)
+        monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: memory)
+        result = mcp_tools._handle_batch({"operations": [
+            {"action": "update", "memory_id": first, "content": "ISSUE821 first"},
+            {"action": "update", "memory_id": second, "content": "ISSUE821 second"},
+        ]})
         assert [item["status"] for item in result["results"]] == ["filtered", "filtered"]
         assert config.calls == 1
-        assert beam.conn.execute("SELECT COUNT(*) FROM working_memory").fetchone()[0] == 0
+        assert memory.beam.get(first)["content"] == "allowed first"
+        assert memory.beam.get(second)["content"] == "allowed second"
     finally:
-        beam.conn.close()
+        memory.conn.close()
