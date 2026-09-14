@@ -2478,7 +2478,10 @@ def _extract_and_store_entities(beam: "BeamMemory", memory_id: str, content: str
         pass
 
 
-def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, source: str = ""):
+def _extract_and_store_facts(
+    beam: "BeamMemory", memory_id: str, content: str, source: str = "",
+    write_policy=None,
+):
     """
     Extract structured facts from content using LLM and store as annotations
     + facts table. Called internally by remember() when extract=True.
@@ -2493,9 +2496,12 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
     coexist.
     """
     try:
-        from mnemosyne.core.extraction import extract_facts_safe
         from mnemosyne.core.annotations import filter_facts
+        from mnemosyne.core.extraction import extract_facts_safe
+        from mnemosyne.core.filters import current_write_policy
 
+        if write_policy is None:
+            write_policy = current_write_policy()
         facts = extract_facts_safe(content)
         if not facts:
             return
@@ -2509,11 +2515,14 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
                 values=kept,
                 source=source,
                 confidence=0.7,
+                _write_policy=write_policy,
             )
 
-        # ALSO store in facts table (new cloud extraction path) -- uses the
-        # full facts list (matching pre-E6 behavior).
-        _store_facts_in_table(beam, memory_id, content, source, facts)
+        # ALSO store every policy-admitted fact in the facts table (new cloud
+        # extraction path), preserving the pre-E6 two-store behavior.
+        _store_facts_in_table(
+            beam, memory_id, content, source, facts, write_policy=write_policy
+        )
 
     except Exception:
         # Fact extraction is best-effort; never fail remember() because of it
@@ -2521,13 +2530,21 @@ def _extract_and_store_facts(beam: "BeamMemory", memory_id: str, content: str, s
 
 
 def _store_facts_in_table(beam: "BeamMemory", memory_id: str,
-                          content: str, source: str, facts: list):
+                          content: str, source: str, facts: list,
+                          write_policy=None):
     """Store extracted free-text facts as simple SPO entries in the facts table."""
     import hashlib
     cursor = beam.conn.cursor()
     timestamp = __import__('datetime').datetime.now().isoformat()
     
-    for i, fact_text in enumerate(facts):
+    from mnemosyne.core.filters import admit_memory_write
+
+    admitted_facts = [
+        fact_text
+        for fact_text in facts
+        if admit_memory_write(fact_text, policy=write_policy)[0]
+    ]
+    for i, fact_text in enumerate(admitted_facts):
         # Derive subject from source, predicate = "stated", object = fact text
         subject = source or "user"
         fact_id = hashlib.sha256(
@@ -5194,11 +5211,21 @@ class BeamMemory:
         """
         # This is the common policy boundary for every public content gateway.
         # It runs before sanitization, deduplication, blob writes, or SQL.
-        from mnemosyne.core.filters import admit_memory_write
+        from mnemosyne.core.filters import (
+            admit_memory_write,
+            current_write_policy,
+            is_write_policy_exempt,
+        )
+
+        write_policy = (
+            _write_policy
+            if _write_policy is not None or is_write_policy_exempt(_write_kind)
+            else current_write_policy()
+        )
         should_write, _decision = admit_memory_write(
             content if _write_policy_content is None else _write_policy_content,
             write_kind=_write_kind,
-            policy=_write_policy,
+            policy=write_policy,
         )
         if not should_write:
             return None  # type: ignore[return-value]
@@ -5293,7 +5320,9 @@ class BeamMemory:
                 if extract_entities:
                     _extract_and_store_entities(self, existing_id, content)
                 if extract:
-                    _extract_and_store_facts(self, existing_id, content, source)
+                    _extract_and_store_facts(
+                        self, existing_id, content, source, write_policy
+                    )
                 # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
                 # Populates memoria_facts, memoria_timelines, memoria_kg for the
                 # structured retrieval router. Runs silently on every remember()
@@ -5390,7 +5419,9 @@ class BeamMemory:
 
             # --- Structured fact extraction ---
             if extract:
-                _extract_and_store_facts(self, memory_id, content, source)
+                _extract_and_store_facts(
+                    self, memory_id, content, source, write_policy
+                )
 
             # Phase 2: MEMORIA regex-based extraction (always-on, zero-LLM-cost).
             # Populates memoria_facts, memoria_timelines, memoria_kg for the
@@ -6372,7 +6403,7 @@ class BeamMemory:
 
     def update_working(self, memory_id: str, content: str = None,
                        importance: float = None, pinned: int = None,
-                       timestamp: str = None, _write_policy=None) -> bool:
+                       timestamp: str = None, _write_policy=None) -> Optional[bool]:
         """Update a working_memory entry.
 
         After updating content, reindexes FTS5 (via wm_au trigger) and
@@ -6391,7 +6422,7 @@ class BeamMemory:
                 content, policy=_write_policy
             )
             if not should_write:
-                return None  # type: ignore[return-value]
+                return None
 
         cursor = self.conn.cursor()
         updates = []

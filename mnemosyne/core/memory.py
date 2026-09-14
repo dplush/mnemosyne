@@ -835,7 +835,7 @@ class Mnemosyne:
         return result
 
     def update(self, memory_id: str, content: str = None,
-               importance: float = None) -> bool:
+               importance: float = None) -> Optional[bool]:
         """Update an existing memory in legacy table and BEAM."""
         policy = None
         if content is not None:
@@ -843,7 +843,7 @@ class Mnemosyne:
 
             policy = current_write_policy()
             if not admit_memory_write(content, policy=policy)[0]:
-                return None  # type: ignore[return-value]
+                return None
 
         cursor = self.conn.cursor()
 
@@ -1409,7 +1409,7 @@ def get(memory_id: str, bank: str = None) -> Optional[Dict]:
     return _get_default(bank).get(memory_id)
 
 
-def update(memory_id: str, content: str = None, importance: float = None, bank: str = None) -> bool:
+def update(memory_id: str, content: str = None, importance: float = None, bank: str = None) -> Optional[bool]:
     """Update memory using the global instance"""
     return _get_default(bank).update(memory_id, content, importance)
 

@@ -2113,9 +2113,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         try:
             from mnemosyne.core.filters import write_policy_operation
 
+            self._maybe_retry_init()
+            self._ensure_initialized_for_tools()
             with write_policy_operation(getattr(self, "_write_policy", None)):
-                self._maybe_retry_init()
-                self._ensure_initialized_for_tools()
                 # Tools use the durable session selected by on_session_switch().
                 # Hold the same session lock for the complete dispatch so a write,
                 # recall, or sleep cannot be re-attributed mid-operation.

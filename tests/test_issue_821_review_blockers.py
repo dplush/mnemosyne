@@ -868,3 +868,192 @@ def test_facade_allowed_data_uri_preserves_blob_extraction(
         assert any(path.is_file() for path in blob_dir.rglob("*"))
     finally:
         memory.conn.close()
+
+
+def test_lazy_tool_initialization_precedes_policy_snapshot():
+    from contextlib import contextmanager
+
+    import mnemosyne_hermes
+    from mnemosyne.core.filters import WritePolicySnapshot, current_write_policy
+
+    provider = mnemosyne_hermes.MnemosyneMemoryProvider.__new__(
+        mnemosyne_hermes.MnemosyneMemoryProvider
+    )
+    provider._write_policy = None
+    provider._reflect_disabled_for_cron = False
+    provider._agent_context = ""
+    provider.has_tool = lambda _name: True
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    calls = []
+
+    def initialize_policy():
+        calls.append("retry")
+        provider._write_policy = strict
+
+    provider._maybe_retry_init = initialize_policy
+    provider._ensure_initialized_for_tools = lambda: calls.append("ensure")
+
+    @contextmanager
+    def beam_scope(_session_id):
+        yield object()
+
+    provider._beam_session_scope = beam_scope
+
+    def dispatch(_tool_name, _args):
+        calls.append("dispatch")
+        return json.dumps({"mode": current_write_policy().classifier_mode})
+
+    provider._dispatch_tool_call_locked = dispatch
+
+    result = json.loads(provider.handle_tool_call("mnemosyne_remember", {}))
+
+    assert result == {"mode": "strict"}
+    assert calls == ["retry", "ensure", "dispatch"]
+
+
+def test_fact_enrichment_reuses_one_policy_snapshot(tmp_path: Path, monkeypatch):
+    from mnemosyne.core import extraction, filters
+    from mnemosyne.core.filters import WritePolicySnapshot
+    from mnemosyne.core.memory import Mnemosyne
+
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    resolutions = 0
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return strict
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    monkeypatch.setattr(
+        extraction,
+        "extract_facts_safe",
+        lambda _content: ["ISSUE821 generated fact must not persist"],
+    )
+    memory = Mnemosyne(session_id="fact-snapshot", db_path=tmp_path / "facts.db")
+    try:
+        memory_id = memory.remember(
+            "Allowed note about Alice",
+            extract=True,
+            extract_entities=True,
+        )
+        assert memory_id is not None
+        # One facade resolution plus the pre-existing temporal-annotation path;
+        # fact annotation/table admission must not resolve a third snapshot.
+        assert resolutions == 2
+        assert memory.beam.annotations.query_by_memory(memory_id, kind="fact") == []
+        mentions = memory.beam.annotations.query_by_memory(memory_id, kind="mentions")
+        assert "Alice" in [row["value"] for row in mentions]
+        assert memory.conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE object LIKE 'ISSUE821%'"
+        ).fetchone()[0] == 0
+    finally:
+        memory.conn.close()
+
+
+def test_media_moments_are_admitted_before_store_and_bind(tmp_path: Path, monkeypatch):
+    from mnemosyne.core import filters, media
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+    from mnemosyne.core.modality_backends import DescribedMoment, DescribeResult
+
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    resolutions = 0
+
+    def resolve_once():
+        nonlocal resolutions
+        resolutions += 1
+        return strict
+
+    monkeypatch.setattr(filters, "resolve_write_policy", resolve_once)
+    monkeypatch.setattr(
+        media,
+        "_describe",
+        lambda *_args, **_kwargs: DescribeResult(
+            provider="stub",
+            moments=[
+                DescribedMoment(kind="caption", text="ISSUE821 blocked caption"),
+                DescribedMoment(
+                    kind="ocr", text="allowed OCR", bbox=[0.1, 0.2, 0.3, 0.4]
+                ),
+            ],
+        ),
+    )
+    beam = BeamMemory(session_id="media-snapshot", db_path=tmp_path / "media.db")
+    try:
+        result = beam.remember_media("https://example.test/allowed.png")
+        assert result.status == "partial"
+        assert resolutions == 1
+        moments = beam.media.get_moments(result.asset_id)
+        assert [row["text"] for row in moments] == ["allowed OCR"]
+        assert len(result.moment_ids) == len(result.memory_ids) == 1
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content LIKE 'ISSUE821%'"
+        ).fetchone()[0] == 0
+        assert any("write policy" in warning for warning in result.warnings)
+    finally:
+        beam.conn.close()
+
+
+def test_update_filtered_result_typing_and_user_surfaces(
+    tmp_path: Path, monkeypatch, capsys
+):
+    import typing
+
+    from mnemosyne import cli, mcp_tools
+    from mnemosyne.core import memory as memory_module
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.memory import Mnemosyne
+
+    optional_bool = typing.Optional[bool]
+    assert typing.get_type_hints(BeamMemory.update_working)["return"] == optional_bool
+    assert typing.get_type_hints(Mnemosyne.update)["return"] == optional_bool
+    assert typing.get_type_hints(memory_module.update)["return"] == optional_bool
+
+    memory = Mnemosyne(session_id="update-surfaces", db_path=tmp_path / "updates.db")
+    marker = "ISSUE821 rejected update content"
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    try:
+        memory_id = memory.remember("allowed original")
+        monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: memory)
+        monkeypatch.setattr(cli, "_get_memory", lambda: memory)
+
+        with write_policy_operation(strict):
+            mcp_result = mcp_tools._handle_update(
+                {"memory_id": memory_id, "content": marker}
+            )
+            with pytest.raises(SystemExit) as exc:
+                cli.cmd_update([memory_id, marker])
+
+        assert mcp_result == {"status": "filtered", "memory_id": memory_id}
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert f"Update filtered by write policy: {memory_id}" in captured.err
+        assert marker not in captured.err
+        assert memory.beam.get(memory_id)["content"] == "allowed original"
+    finally:
+        memory.conn.close()
+
+
+def test_wrapper_batch_adapter_does_not_retry_filtered_update():
+    from types import SimpleNamespace
+
+    from mnemosyne import mcp_tools
+
+    class FilteredMemory:
+        def __init__(self):
+            self.beam = SimpleNamespace(conn=object(), update_working=self.fail_fallback)
+            self.conn = object()
+            self._emit_wrapper = lambda *_args, **_kwargs: None
+
+        def update(self, *_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def fail_fallback(*_args, **_kwargs):
+            raise AssertionError("filtered updates must not fall through to Beam")
+
+    adapter = mcp_tools._WrapperBatchAdapter(FilteredMemory())
+    assert adapter.update_working("memory", content="blocked") is None

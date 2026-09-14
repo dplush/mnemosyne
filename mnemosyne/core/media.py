@@ -1432,6 +1432,21 @@ def remember_media(
         if skipped:
             warnings.append(f"{skipped} provider moment(s) dropped as unwritable")
 
+        from mnemosyne.core.filters import admit_memory_write
+
+        admitted_drafts = [
+            draft
+            for draft in drafts
+            if admit_memory_write(draft.text, policy=write_policy)[0]
+        ]
+        filtered = len(drafts) - len(admitted_drafts)
+        if filtered:
+            skipped += filtered
+            warnings.append(
+                f"{filtered} provider moment(s) dropped by write policy"
+            )
+        drafts = admitted_drafts
+
         if not drafts:
             status = "partial" if result.summary else "unavailable"
             return MediaIngestResult(

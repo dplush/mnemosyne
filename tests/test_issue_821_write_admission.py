@@ -176,6 +176,11 @@ elif os.environ["GATEWAY"] == "task_progress":
     )
 elif os.environ["GATEWAY"] == "scratchpad":
     response = provider.handle_tool_call("mnemosyne_scratchpad_write", {"content": marker})
+elif os.environ["GATEWAY"] == "triple_add":
+    response = provider.handle_tool_call(
+        "mnemosyne_triple_add",
+        {"subject": "user", "predicate": "prefers", "object": marker},
+    )
 else:
     raise AssertionError(os.environ["GATEWAY"])
 beams = [provider._beam]
@@ -213,6 +218,7 @@ print(json.dumps({
         "remember", "pending_apply", "shared_remember", "batch", "update",
         "validate_update", "sync_identity", "on_memory_add", "on_memory_replace",
         "canonical_create", "canonical_update", "task_progress", "scratchpad",
+        "triple_add",
     ],
 )
 @pytest.mark.parametrize("policy_source", ["initialize", "hermes"])
@@ -255,6 +261,8 @@ def test_every_provider_gateway_honors_provider_policy_over_conflicting_env(
         assert payload["response"] == {"status": "filtered", "store": "canonical"}
     if gateway == "scratchpad":
         assert payload["response"] == {"status": "filtered", "store": "scratchpad"}
+    if gateway == "triple_add":
+        assert payload["response"] == {"status": "filtered"}
     if gateway == "validate_update":
         assert payload["response"]["status"] == "filtered"
         assert set(payload["response"]) <= {"status", "memory_id", "store", "bank"}

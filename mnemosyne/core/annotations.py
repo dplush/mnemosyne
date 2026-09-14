@@ -98,7 +98,7 @@ def filter_facts(facts: List[str]) -> List[str]:
 
 
 def _admit_annotation_values(
-    values: List[str], *, write_kind: object = "public"
+    values: List[str], *, write_kind: object = "public", write_policy=None
 ) -> List[str]:
     """Return values admitted by one immutable write-policy snapshot."""
     from mnemosyne.core.filters import (
@@ -109,7 +109,11 @@ def _admit_annotation_values(
 
     # Trusted derived writes have already crossed the raw-memory admission
     # boundary. Avoid resolving a second snapshot for their extracted values.
-    policy = None if is_write_policy_exempt(write_kind) else current_write_policy()
+    policy = (
+        None
+        if is_write_policy_exempt(write_kind)
+        else write_policy if write_policy is not None else current_write_policy()
+    )
     return [
         value
         for value in values
@@ -259,6 +263,8 @@ class AnnotationStore:
         values: List[str],
         source: str = "",
         confidence: float = 1.0,
+        *,
+        _write_policy=None,
     ) -> int:
         """Batch-insert helper for multiple values under one (memory_id, kind).
 
@@ -271,6 +277,7 @@ class AnnotationStore:
             source,
             confidence,
             _write_kind="public",
+            _write_policy=_write_policy,
         )
 
     def _add_many(
@@ -282,13 +289,18 @@ class AnnotationStore:
         confidence: float = 1.0,
         *,
         _write_kind: object,
+        _write_policy=None,
     ) -> int:
         """Internal batch insert accepting an opaque write capability."""
         if not values:
             return 0
 
         candidates = [v for v in values if v and v.strip()]
-        admitted = _admit_annotation_values(candidates, write_kind=_write_kind)
+        admitted = _admit_annotation_values(
+            candidates,
+            write_kind=_write_kind,
+            write_policy=_write_policy,
+        )
         rows = [
             (memory_id, kind, v, source, confidence)
             for v in admitted

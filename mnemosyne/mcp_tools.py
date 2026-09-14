@@ -246,8 +246,8 @@ class _WrapperBatchAdapter:
 
     def update_working(self, memory_id: str, *, content=None, importance=None):
         wrapper_ok = self._call_wrapper("update", memory_id, content=content, importance=importance)
-        if wrapper_ok:
-            return True
+        if wrapper_ok is not False:
+            return wrapper_ok
         return self._mem.beam.update_working(memory_id, content=content, importance=importance)
 
     def forget_working(self, memory_id: str):
@@ -991,6 +991,8 @@ def _handle_update(arguments: Dict[str, Any]) -> Dict[str, Any]:
     bank = _resolve_bank(arguments)
     mem = _create_instance(author_id=arguments.get("author_id"), author_type=arguments.get("author_type"), channel_id=arguments.get("channel_id"), bank=bank)
     ok = mem.update(memory_id, content=content, importance=importance)
+    if ok is None:
+        return {"status": "filtered", "memory_id": memory_id}
     return {"status": "updated" if ok else "not_found", "memory_id": memory_id}
 
 
