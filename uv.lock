@@ -1029,6 +1029,7 @@ wheels = [
 name = "mnemosyne-memory"
 source = { editable = "." }
 dependencies = [
+    { name = "jsonschema" },
     { name = "pyyaml" },
 ]
 
@@ -1093,6 +1094,7 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'embeddings'", specifier = ">=0.3.0" },
     { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=0.20" },
     { name = "huggingface-hub", marker = "extra == 'llm'", specifier = ">=0.20" },
+    { name = "jsonschema", specifier = ">=4.18" },
     { name = "llama-cpp-python", marker = "extra == 'all'", specifier = ">=0.2.0" },
     { name = "llama-cpp-python", marker = "extra == 'llm'", specifier = ">=0.2.0" },
     { name = "mcp", marker = "python_full_version >= '3.10' and extra == 'all'", specifier = ">=2.0.0" },

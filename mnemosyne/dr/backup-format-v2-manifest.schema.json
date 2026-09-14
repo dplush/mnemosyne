@@ -1,0 +1,528 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnemosyne.local/schemas/backup-format-v2-manifest.schema.json",
+  "title": "Mnemosyne Backup Format v2 Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "format_version",
+    "manifest_version",
+    "backup_id",
+    "created_at",
+    "producer",
+    "status",
+    "discovery",
+    "coverage",
+    "consistency",
+    "self_contained",
+    "scope",
+    "stores",
+    "external_references",
+    "warnings",
+    "errors",
+    "limits"
+  ],
+  "properties": {
+    "format": {
+      "const": "org.mnemosyne.backup"
+    },
+    "format_version": {
+      "const": 2
+    },
+    "manifest_version": {
+      "const": 1
+    },
+    "backup_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "producer": {
+      "$ref": "#/$defs/producer"
+    },
+    "status": {
+      "enum": ["complete", "partial", "failed"]
+    },
+    "discovery": {
+      "$ref": "#/$defs/completenessState"
+    },
+    "coverage": {
+      "$ref": "#/$defs/completenessState"
+    },
+    "consistency": {
+      "enum": ["transactional", "quiesced", "fuzzy"]
+    },
+    "self_contained": {
+      "type": ["boolean", "null"]
+    },
+    "scope": {
+      "$ref": "#/$defs/scope"
+    },
+    "stores": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "$ref": "#/$defs/store"
+      }
+    },
+    "external_references": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/externalReferenceBucket"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "errors": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "limits": {
+      "$ref": "#/$defs/limits"
+    },
+    "lineage": {
+      "$ref": "#/$defs/lineage"
+    }
+  },
+  "$defs": {
+    "storeId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "archivePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*//)[^\\u0000]+$"
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product", "version"],
+      "properties": {
+        "product": {
+          "const": "mnemosyne"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "source_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,64}$"
+        }
+      }
+    },
+    "completenessState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reason_codes"],
+      "properties": {
+        "state": {
+          "enum": ["complete", "partial", "unknown"]
+        },
+        "reason_codes": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9_]+$"
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "discovered", "included", "excluded"],
+      "properties": {
+        "requested": {
+          "$ref": "#/$defs/storeIdList"
+        },
+        "discovered": {
+          "$ref": "#/$defs/storeIdList"
+        },
+        "included": {
+          "$ref": "#/$defs/storeIdList"
+        },
+        "excluded": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["store_id", "reason_code"],
+            "properties": {
+              "store_id": {
+                "$ref": "#/$defs/storeId"
+              },
+              "reason_code": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z0-9_]+$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "storeIdList": {
+      "type": "array",
+      "maxItems": 1024,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/storeId"
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store_id",
+        "kind",
+        "classification",
+        "required",
+        "location_hint",
+        "archive_path",
+        "media_type",
+        "bytes",
+        "sha256",
+        "dependencies",
+        "handling",
+        "privacy",
+        "verification"
+      ],
+      "properties": {
+        "store_id": {
+          "$ref": "#/$defs/storeId"
+        },
+        "kind": {
+          "enum": ["sqlite", "blob-index", "blob", "json", "text", "other"]
+        },
+        "classification": {
+          "enum": [
+            "authoritative",
+            "derived/rebuildable",
+            "external/blob",
+            "unknown/owner decision required"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "location_hint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "archive_path": {
+          "$ref": "#/$defs/archivePath"
+        },
+        "media_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1099511627776
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "dependencies": {
+          "$ref": "#/$defs/storeIdList"
+        },
+        "handling": {
+          "enum": ["snapshot", "rebuild", "reference-only", "exclude"]
+        },
+        "privacy": {
+          "enum": ["high", "moderate", "low"]
+        },
+        "sqlite": {
+          "$ref": "#/$defs/sqliteMetadata"
+        },
+        "catalog": {
+          "type": "array",
+          "maxItems": 65536,
+          "items": {
+            "$ref": "#/$defs/catalogObject"
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/verification"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "sqlite"
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["sqlite", "catalog"]
+          }
+        }
+      ]
+    },
+    "sqliteMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["page_size", "page_count", "user_version", "schema_sha256"],
+      "properties": {
+        "page_size": {
+          "type": "integer",
+          "minimum": 512,
+          "maximum": 65536
+        },
+        "page_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "user_version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "application_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "required_capabilities": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["sqlite", "fts5", "sqlite-vec"]
+          }
+        },
+        "optional_capabilities": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["sqlite", "fts5", "sqlite-vec"]
+          }
+        }
+      }
+    },
+    "catalogObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "object_type", "classification", "handling"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "object_type": {
+          "enum": ["table", "virtual-table", "view", "index", "trigger", "unknown"]
+        },
+        "classification": {
+          "enum": [
+            "authoritative",
+            "derived/rebuildable",
+            "external/blob",
+            "unknown/owner decision required"
+          ]
+        },
+        "handling": {
+          "enum": ["snapshot", "rebuild", "reference-only", "exclude"]
+        },
+        "row_count": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "dependencies": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          }
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "checks"],
+      "properties": {
+        "status": {
+          "enum": ["verified", "verified_degraded", "unverifiable", "failed"]
+        },
+        "checks": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "status"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z0-9_]+$"
+              },
+              "status": {
+                "enum": ["pass", "degraded", "unverifiable", "fail"]
+              },
+              "code": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[a-z0-9_]+$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "externalReferenceBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "count", "owned"],
+      "properties": {
+        "scheme": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-z0-9+.-]+$"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "owned": {
+          "type": "boolean"
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "phase"],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_argument",
+            "unsupported_format",
+            "invalid_manifest",
+            "unsafe_archive_path",
+            "duplicate_archive_member",
+            "limit_exceeded",
+            "source_not_found",
+            "source_busy",
+            "maintenance_required",
+            "discovery_incomplete",
+            "unknown_store",
+            "snapshot_failed",
+            "missing_entry",
+            "size_mismatch",
+            "checksum_mismatch",
+            "sqlite_integrity_failed",
+            "foreign_key_failed",
+            "schema_mismatch",
+            "blob_missing",
+            "capability_unavailable",
+            "product_smoke_failed",
+            "destination_exists",
+            "staging_failed",
+            "publish_failed",
+            "rollback_failed",
+            "legacy_v1_metadata_missing",
+            "legacy_v1_checksum_mismatch",
+            "legacy_v1_completeness_unknown",
+            "legacy_v1_restore_unverifiable"
+          ]
+        },
+        "phase": {
+          "enum": ["discover", "snapshot", "package", "verify", "extract", "stage", "restore", "publish"]
+        },
+        "store_id": {
+          "$ref": "#/$defs/storeId"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest_bytes",
+        "archive_members",
+        "sqlite_stores",
+        "catalog_objects_per_store",
+        "single_member_bytes",
+        "total_uncompressed_bytes",
+        "compression_ratio",
+        "path_bytes",
+        "path_depth",
+        "diagnostics",
+        "external_reference_buckets"
+      ],
+      "properties": {
+        "manifest_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216},
+        "archive_members": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "sqlite_stores": {"type": "integer", "minimum": 0, "maximum": 1024},
+        "catalog_objects_per_store": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "single_member_bytes": {"type": "integer", "minimum": 1, "maximum": 68719476736},
+        "total_uncompressed_bytes": {"type": "integer", "minimum": 1, "maximum": 1099511627776},
+        "compression_ratio": {"type": "number", "exclusiveMinimum": 0, "maximum": 1000},
+        "path_bytes": {"const": 240},
+        "path_depth": {"const": 8},
+        "diagnostics": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "external_reference_buckets": {"type": "integer", "minimum": 1, "maximum": 256}
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_format", "source_sha256"],
+      "properties": {
+        "source_format": {
+          "enum": ["legacy-v1", "backup-v2"]
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}
