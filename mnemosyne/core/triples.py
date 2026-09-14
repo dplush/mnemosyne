@@ -116,6 +116,14 @@ def init_triples(db_path: Path = None):
             pass
 
 
+def _admit_triple_object(object: str) -> bool:
+    """Apply the active operation's write policy to a raw triple object."""
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
+
+    policy = current_write_policy()
+    return admit_memory_write(object, policy=policy)[0]
+
+
 class TripleStore:
     """
     Temporal knowledge graph for Mnemosyne — single-current-truth semantics.
@@ -148,7 +156,7 @@ class TripleStore:
     def add(self, subject: str, predicate: str, object: str,
             valid_from: str = None, source: str = "inferred",
             confidence: float = 1.0, valid_until: str = None,
-            supersede: bool = True) -> int:
+            supersede: bool = True) -> int | None:
         """
         Add a temporal triple.
 
@@ -159,7 +167,13 @@ class TripleStore:
         multiple simultaneous values for one predicate (multi-valued facts,
         e.g. ('user','speaks','English') + ('user','speaks','Spanish')).
         valid_until: optional explicit expiry date (ISO YYYY-MM-DD) for the row.
+
+        Returns the inserted row id, or ``None`` when write policy rejects the
+        object.
         """
+        if not _admit_triple_object(object):
+            return None
+
         valid_from = valid_from or datetime.now().isoformat()[:10]
 
         cursor = self.conn.cursor()
@@ -514,16 +528,24 @@ class TripleStore:
 def add_triple(subject: str, predicate: str, object: str,
                valid_from: str = None, source: str = "inferred",
                confidence: float = 1.0, db_path: Path = None,
-               valid_until: str = None, supersede: bool = True) -> int:
+               valid_until: str = None, supersede: bool = True) -> int | None:
     """
     Add a temporal triple without instantiating TripleStore manually.
     Optional db_path aligns with BEAM memory database when used from Hermes.
     valid_until/supersede passthrough (see TripleStore.add).
     """
-    store = TripleStore(db_path=db_path)
-    return store.add(subject, predicate, object,
-                     valid_from=valid_from, source=source, confidence=confidence,
-                     valid_until=valid_until, supersede=supersede)
+    from mnemosyne.core.filters import write_policy_operation
+
+    with write_policy_operation():
+        if not _admit_triple_object(object):
+            return None
+
+        store = TripleStore(db_path=db_path)
+        return store.add(
+            subject, predicate, object,
+            valid_from=valid_from, source=source, confidence=confidence,
+            valid_until=valid_until, supersede=supersede,
+        )
 
 
 def end_triple(subject: str, predicate: str, object: str = None,

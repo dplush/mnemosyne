@@ -315,6 +315,58 @@ def test_direct_mcp_triple_add_admits_annotation_and_triple_objects(
         memory.conn.close()
 
 
+def test_direct_add_triple_admits_object_before_supersede(tmp_path: Path):
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.triples import TripleStore, add_triple
+
+    db_path = tmp_path / "direct-add-triple.db"
+    marker = "ISSUE821 rejected add_triple object"
+
+    with write_policy_operation(WritePolicySnapshot((r"^ISSUE821",), "strict")):
+        existing_id = add_triple(
+            "user", "prefers", "allowed old value", db_path=db_path
+        )
+        rejected = add_triple("user", "prefers", marker, db_path=db_path)
+
+    triples = TripleStore(db_path=db_path)
+    try:
+        assert rejected is None
+        rows = triples.conn.execute(
+            "SELECT id, object, valid_until FROM triples WHERE subject = ? AND predicate = ?",
+            ("user", "prefers"),
+        ).fetchall()
+        assert [(row[0], row[1], row[2]) for row in rows] == [
+            (existing_id, "allowed old value", None)
+        ]
+        assert marker not in str([tuple(row) for row in rows])
+    finally:
+        triples.conn.close()
+
+
+def test_direct_triple_store_add_admits_object_before_supersede(tmp_path: Path):
+    from mnemosyne.core.filters import WritePolicySnapshot, write_policy_operation
+    from mnemosyne.core.triples import TripleStore
+
+    triples = TripleStore(db_path=tmp_path / "direct-store-add.db")
+    marker = "ISSUE821 rejected TripleStore.add object"
+    try:
+        with write_policy_operation(WritePolicySnapshot((r"^ISSUE821",), "strict")):
+            existing_id = triples.add("user", "prefers", "allowed old value")
+            rejected = triples.add("user", "prefers", marker)
+
+        assert rejected is None
+        rows = triples.conn.execute(
+            "SELECT id, object, valid_until FROM triples WHERE subject = ? AND predicate = ?",
+            ("user", "prefers"),
+        ).fetchall()
+        assert [(row[0], row[1], row[2]) for row in rows] == [
+            (existing_id, "allowed old value", None)
+        ]
+        assert marker not in str([tuple(row) for row in rows])
+    finally:
+        triples.conn.close()
+
+
 @pytest.mark.parametrize("provider_name", ["hermes_memory_provider", "mnemosyne_hermes"])
 def test_provider_triple_add_admits_object_before_supersede(
     tmp_path: Path, provider_name: str, caplog
