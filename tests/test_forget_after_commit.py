@@ -90,3 +90,80 @@ def test_failing_hook_does_not_break_commit(tmp_path: Path):
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = 'hook-row'"
     ).fetchone()[0] == 1
+
+
+def test_hook_registered_by_hook_defers_to_next_commit(tmp_path: Path):
+    """A hook queued from inside a running hook fires on the next commit."""
+    mem, _ = _mem_with_events(tmp_path)
+    fired: list = []
+    mem.conn.execute("BEGIN")
+    mem.conn.execute(
+        "INSERT INTO working_memory (id, content) VALUES ('re-row', 'x')"
+    )
+
+    def first() -> None:
+        """Queue the follow-up hook; it must not run in this drain."""
+        fired.append("first")
+        mem.conn._after_commit_hooks.append(lambda: fired.append("second"))  # noqa: SLF001
+
+    mem.conn._after_commit_hooks.append(first)  # noqa: SLF001
+    mem.conn.commit()
+    assert fired == ["first"]
+    mem.conn.commit()
+    assert fired == ["first", "second"]
+
+
+def test_legacy_only_emit_follows_caller_commit(tmp_path: Path):
+    """Legacy-mirror deletes emit on caller commit, never on rollback."""
+    mem, events = _mem_with_events(tmp_path)
+    mem.conn.execute(
+        "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, content TEXT, "
+        "source TEXT, timestamp TEXT, session_id TEXT, importance REAL, metadata_json TEXT)"
+    )
+    mem.conn.execute(
+        "INSERT INTO memories (id, content, session_id) VALUES ('leg-1', 'x', 'ac-test')"
+    )
+    mem.conn.commit()
+
+    mem.conn.execute("BEGIN")
+    assert mem.forget("leg-1") is False
+    assert events == []
+    mem.conn.commit()
+    assert events == [(("MEMORY_INVALIDATED", "leg-1"), {})]
+
+    mem.conn.execute(
+        "INSERT INTO memories (id, content, session_id) VALUES ('leg-2', 'x', 'ac-test')"
+    )
+    mem.conn.commit()
+    mem.conn.execute("BEGIN")
+    assert mem.forget("leg-2") is False
+    mem.conn.rollback()
+    assert len(events) == 1
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE id = 'leg-2'"
+    ).fetchone()[0] == 1
+
+
+def test_no_raw_transaction_ending_sql(tmp_path: Path):
+    """Pin the hook-aware invariant: no raw COMMIT/ROLLBACK/END statements.
+
+    After-commit hooks live on _BeamConnection.commit()/rollback(). A raw
+    transaction-ending statement would bypass them, so the codebase must
+    keep routing transaction control through those methods.
+    """
+    del tmp_path  # static source scan; no fixture DB needed
+    import re
+
+    core = Path(__file__).resolve().parent.parent / "mnemosyne" / "core"
+    # ROLLBACK TO SAVEPOINT is excluded: it neither ends the transaction
+    # nor bypasses the hooks, unlike bare COMMIT / ROLLBACK / END.
+    pattern = re.compile(
+        r"""execute\s*\(\s*['\"](COMMIT|END|ROLLBACK(?!\s+TO))\b""", re.IGNORECASE
+    )
+    offenders = [
+        f"{p.name}:{i + 1}"
+        for p in sorted(core.glob("*.py"))
+        for i, line in enumerate(p.read_text().splitlines())
+        if pattern.search(line)
+    ]
+    assert offenders == []
