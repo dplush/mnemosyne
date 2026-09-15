@@ -322,7 +322,7 @@ class AnnotationStore:
             rows,
         )
         self.conn.commit()
-        return len(rows)
+        return cursor.rowcount
 
     # ------------------------------------------------------------------
     # Reads

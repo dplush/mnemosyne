@@ -116,12 +116,17 @@ def init_triples(db_path: Path = None):
             pass
 
 
-def _admit_triple_object(object: str) -> bool:
-    """Apply the active operation's write policy to a raw triple object."""
+def _admit_triple_fields(
+    subject: str, predicate: str, object: str, *, policy=None
+) -> bool:
+    """Apply one write-policy snapshot to every persisted triple text field."""
     from mnemosyne.core.filters import admit_memory_write, current_write_policy
 
-    policy = current_write_policy()
-    return admit_memory_write(object, policy=policy)[0]
+    policy = policy or current_write_policy()
+    return all(
+        admit_memory_write(value, policy=policy)[0]
+        for value in (subject, predicate, object)
+    )
 
 
 class TripleStore:
@@ -156,7 +161,7 @@ class TripleStore:
     def add(self, subject: str, predicate: str, object: str,
             valid_from: str = None, source: str = "inferred",
             confidence: float = 1.0, valid_until: str = None,
-            supersede: bool = True) -> int | None:
+            supersede: bool = True, *, _write_policy=None) -> int | None:
         """
         Add a temporal triple.
 
@@ -168,10 +173,12 @@ class TripleStore:
         e.g. ('user','speaks','English') + ('user','speaks','Spanish')).
         valid_until: optional explicit expiry date (ISO YYYY-MM-DD) for the row.
 
-        Returns the inserted row id, or ``None`` when write policy rejects the
-        object.
+        Returns the inserted row id, or ``None`` when write policy rejects a
+        persisted text field.
         """
-        if not _admit_triple_object(object):
+        if not _admit_triple_fields(
+            subject, predicate, object, policy=_write_policy
+        ):
             return None
 
         valid_from = valid_from or datetime.now().isoformat()[:10]
@@ -348,10 +355,9 @@ class TripleStore:
             if not admitted:
                 return 0
             store = AnnotationStore(db_path=self.db_path)
-            store.add_many(
+            return store.add_many(
                 memory_id, "fact", admitted, source=source, confidence=confidence
             )
-            return len(admitted)
 
     def export_all(self) -> List[Dict]:
         """Export all triples to a list of dictionaries."""
@@ -546,10 +552,11 @@ def add_triple(subject: str, predicate: str, object: str,
     Optional db_path aligns with BEAM memory database when used from Hermes.
     valid_until/supersede passthrough (see TripleStore.add).
     """
-    from mnemosyne.core.filters import write_policy_operation
+    from mnemosyne.core.filters import current_write_policy, write_policy_operation
 
     with write_policy_operation():
-        if not _admit_triple_object(object):
+        policy = current_write_policy()
+        if not _admit_triple_fields(subject, predicate, object, policy=policy):
             return None
 
         store = TripleStore(db_path=db_path)
@@ -557,6 +564,7 @@ def add_triple(subject: str, predicate: str, object: str,
             subject, predicate, object,
             valid_from=valid_from, source=source, confidence=confidence,
             valid_until=valid_until, supersede=supersede,
+            _write_policy=policy,
         )
 
 

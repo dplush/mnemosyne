@@ -579,16 +579,22 @@ def _handle_validate(arguments: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": f"unknown store: {store}"}
     if action == "update" and not new_content:
         return {"error": "new_content is required for action='update'"}
-    if action == "update":
-        from mnemosyne.core.filters import admit_memory_write
+    from mnemosyne.core.filters import admit_memory_write, current_write_policy
 
-        if not admit_memory_write(new_content)[0]:
-            return {
-                "status": "filtered",
-                "memory_id": memory_id,
-                "store": store,
-                "bank": bank,
-            }
+    policy = current_write_policy()
+    persisted_inputs = (
+        arguments.get("validator"),
+        new_content if action == "update" else None,
+        note,
+    )
+    if any(value and not admit_memory_write(value, policy=policy)[0]
+           for value in persisted_inputs):
+        return {
+            "status": "filtered",
+            "memory_id": memory_id,
+            "store": store,
+            "bank": bank,
+        }
 
     if store == "surface":
         target_beam = _create_surface_instance()
@@ -731,7 +737,10 @@ def _handle_triple_add(arguments: Dict[str, Any]) -> Dict[str, Any]:
     with write_policy_operation(policy):
         predicate = arguments["predicate"]
         annotation_path = isinstance(predicate, str) and predicate in ANNOTATION_KINDS
-        if not admit_memory_write(arguments["object"], policy=policy)[0]:
+        if any(
+            not admit_memory_write(arguments[field], policy=policy)[0]
+            for field in ("subject", "predicate", "object")
+        ):
             return {
                 "status": "filtered",
                 "store": "annotations" if annotation_path else "triples",

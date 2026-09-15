@@ -5463,7 +5463,7 @@ class BeamMemory:
                        force_veracity: bool = False,
                        trust_tier: str = "IMPORTED",
                        extract_entities: bool = False,
-                       extract: bool = False) -> List[str]:
+                       extract: bool = False) -> List[Optional[str]]:
         """
         Batch insert into working_memory for high-throughput ingestion.
         Each item dict should have keys: content, source, importance,
@@ -5542,16 +5542,19 @@ class BeamMemory:
         """
         from mnemosyne.core.filters import admit_memory_write, current_write_policy
         policy = current_write_policy()
+        result_ids: List[Optional[str]] = [None] * len(items)
         admitted_items = []
-        for item in items:
+        admitted_positions = []
+        for position, item in enumerate(items):
             should_write, _decision = admit_memory_write(
                 item["content"], policy=policy
             )
             if should_write:
                 admitted_items.append(item)
+                admitted_positions.append(position)
         items = admitted_items
         if not items:
-            return []
+            return result_ids
 
         cursor = self.conn.cursor()
         ids = []
@@ -5580,6 +5583,7 @@ class BeamMemory:
 
             memory_id = _generate_id(item["content"])
             ids.append(memory_id)
+            result_ids[admitted_positions[len(ids) - 1]] = memory_id
             # Typed memory classification
             # Per-item explicit type wins and short-circuits the classifier,
             # matching remember(). There is no method-level default: a batch
@@ -5739,7 +5743,7 @@ class BeamMemory:
                 )
 
         self._trim_working_memory()
-        return ids
+        return result_ids
 
     def _ingest_graph_and_veracity(self, memory_id: str, content: str,
                                     source: str, veracity: str = "unknown"):
