@@ -113,6 +113,7 @@ marker = (
 response = None
 original = None
 validate_compatibility = None
+update_not_found = None
 if os.environ["GATEWAY"] == "remember":
     response = provider.handle_tool_call("mnemosyne_remember", {"content": marker})
 elif os.environ["GATEWAY"] == "pending_apply":
@@ -135,6 +136,9 @@ elif os.environ["GATEWAY"] in {"update", "validate_update"}:
         response = provider.handle_tool_call(
             "mnemosyne_update", {"memory_id": memory_id, "content": marker}
         )
+        update_not_found = json.loads(provider.handle_tool_call(
+            "mnemosyne_update", {"memory_id": "missing-id", "content": "allowed update"}
+        ))
     else:
         response = provider.handle_tool_call(
             "mnemosyne_validate",
@@ -204,6 +208,7 @@ print(json.dumps({
     "original": original,
     "response": json.loads(response) if response else None,
     "validate_compatibility": validate_compatibility,
+    "update_not_found": update_not_found,
     "mode": provider._write_policy.classifier_mode,
     "patterns": provider._write_policy.ignore_patterns,
     "same_env": env_before == {key: os.environ.get(key) for key in policy_env},
@@ -257,6 +262,11 @@ def test_every_provider_gateway_honors_provider_policy_over_conflicting_env(
     assert payload["same_env"] is True
     if gateway in {"update", "validate_update", "canonical_update"}:
         assert payload["original"] == "allowed original"
+    if gateway == "update":
+        assert payload["response"]["status"] == "filtered"
+        assert payload["update_not_found"] == {
+            "status": "not_found", "memory_id": "missing-id"
+        }
     if gateway in {"canonical_create", "canonical_update", "task_progress"}:
         assert payload["response"] == {"status": "filtered", "store": "canonical"}
     if gateway == "scratchpad":

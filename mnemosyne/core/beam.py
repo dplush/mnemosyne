@@ -5163,7 +5163,7 @@ class BeamMemory:
                  dedupe: bool = True,
                  _write_kind: object = "public",
                  _write_policy=None,
-                 _write_policy_content: Optional[str] = None) -> str:
+                 _write_policy_content: Optional[str] = None) -> Optional[str]:
         """Store into working_memory. Deduplicates exact content matches.
 
         When called from the legacy-compatible Mnemosyne.remember() path,
@@ -5228,7 +5228,7 @@ class BeamMemory:
             policy=write_policy,
         )
         if not should_write:
-            return None  # type: ignore[return-value]
+            return None
 
         # Clamp veracity at the BeamMemory.remember entry too -- the
         # method is the lowest-level public ingest path under BeamMemory,
@@ -5710,7 +5710,10 @@ class BeamMemory:
                 if extract_entities:
                     _extract_and_store_entities(self, memory_id, row_content)
                 if extract:
-                    _extract_and_store_facts(self, memory_id, row_content, item_source)
+                    _extract_and_store_facts(
+                        self, memory_id, row_content, item_source,
+                        write_policy=policy,
+                    )
                 # Phase 2: MEMORIA regex-based extraction for every batch row.
                 try:
                     self.extract_and_store_facts(row_content, message_idx=0, source_memory_id=memory_id)
@@ -6607,7 +6610,7 @@ class BeamMemory:
                                 event_date_precision: 'Optional[str]' = None,
                                 emit_event: bool = True,
                                 _write_kind: object = "public",
-                                _write_policy=None) -> str:
+                                _write_policy=None) -> Optional[str]:
         """
         Store a consolidated summary into episodic_memory with optional embedding.
 
@@ -6639,7 +6642,7 @@ class BeamMemory:
             summary, write_kind=_write_kind, policy=_write_policy
         )
         if not should_write:
-            return None  # type: ignore[return-value]
+            return None
 
         # Caller-owned transaction gate (round-4): the MEMORY_CONSOLIDATED
         # event must never precede the commit that persists the row. Under

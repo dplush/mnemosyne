@@ -986,7 +986,12 @@ def test_media_moments_are_admitted_before_store_and_bind(tmp_path: Path, monkey
         assert resolutions == 1
         moments = beam.media.get_moments(result.asset_id)
         assert [row["text"] for row in moments] == ["allowed OCR"]
+        assert [row["memory_id"] for row in moments] == result.memory_ids
         assert len(result.moment_ids) == len(result.memory_ids) == 1
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM media_moments WHERE text LIKE 'ISSUE821%' "
+            "OR (text = 'allowed OCR' AND memory_id IS NULL)"
+        ).fetchone()[0] == 0
         assert beam.conn.execute(
             "SELECT COUNT(*) FROM working_memory WHERE content LIKE 'ISSUE821%'"
         ).fetchone()[0] == 0
@@ -1007,6 +1012,13 @@ def test_update_filtered_result_typing_and_user_surfaces(
     from mnemosyne.core.memory import Mnemosyne
 
     optional_bool = typing.Optional[bool]
+    optional_str = typing.Optional[str]
+    assert typing.get_type_hints(BeamMemory.remember)["return"] == optional_str
+    assert (
+        typing.get_type_hints(BeamMemory.consolidate_to_episodic)["return"]
+        == optional_str
+    )
+    assert typing.get_type_hints(Mnemosyne.remember)["return"] == optional_str
     assert typing.get_type_hints(BeamMemory.update_working)["return"] == optional_bool
     assert typing.get_type_hints(Mnemosyne.update)["return"] == optional_bool
     assert typing.get_type_hints(memory_module.update)["return"] == optional_bool
@@ -1032,6 +1044,13 @@ def test_update_filtered_result_typing_and_user_surfaces(
         assert captured.out == ""
         assert f"Update filtered by write policy: {memory_id}" in captured.err
         assert marker not in captured.err
+
+        with pytest.raises(SystemExit) as missing_exc:
+            cli.cmd_update(["missing-id", "allowed update"])
+        assert missing_exc.value.code == 1
+        missing_output = capsys.readouterr()
+        assert missing_output.out == ""
+        assert "Memory not found: missing-id" in missing_output.err
         assert memory.beam.get(memory_id)["content"] == "allowed original"
     finally:
         memory.conn.close()
@@ -1057,3 +1076,88 @@ def test_wrapper_batch_adapter_does_not_retry_filtered_update():
 
     adapter = mcp_tools._WrapperBatchAdapter(FilteredMemory())
     assert adapter.update_working("memory", content="blocked") is None
+
+
+def test_batch_fact_enrichment_reuses_batch_policy_snapshot(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne.core import beam as beam_module
+    from mnemosyne.core import extraction, filters
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    permissive = WritePolicySnapshot((), "off")
+    resolutions = 0
+    fact_policies = []
+
+    def changing_policy():
+        nonlocal resolutions
+        resolutions += 1
+        return strict if resolutions == 1 else permissive
+
+    real_extract = beam_module._extract_and_store_facts
+
+    def capture_fact_policy(*args, **kwargs):
+        fact_policies.append(kwargs.get("write_policy"))
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(filters, "resolve_write_policy", changing_policy)
+    monkeypatch.setattr(beam_module, "_extract_and_store_facts", capture_fact_policy)
+    monkeypatch.setattr(
+        extraction,
+        "extract_facts_safe",
+        lambda _content: ["ISSUE821 generated batch fact must not persist"],
+    )
+    beam = BeamMemory(session_id="batch-fact-snapshot", db_path=tmp_path / "batch.db")
+    try:
+        memory_ids = beam.remember_batch(
+            [{"content": "Allowed batch note", "source": "test"}],
+            extract=True,
+        )
+        assert len(memory_ids) == 1
+        assert fact_policies == [strict]
+        assert beam.annotations.query_by_memory(memory_ids[0], kind="fact") == []
+        assert beam.conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE object LIKE 'ISSUE821%'"
+        ).fetchone()[0] == 0
+    finally:
+        beam.conn.close()
+
+
+def test_mcp_annotation_triple_add_reuses_operation_policy_snapshot(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne import mcp_tools
+    from mnemosyne.core import filters
+    from mnemosyne.core.filters import WritePolicySnapshot
+    from mnemosyne.core.memory import Mnemosyne
+
+    permissive = WritePolicySnapshot((), "off")
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    resolutions = 0
+
+    def changing_policy():
+        nonlocal resolutions
+        resolutions += 1
+        return permissive if resolutions == 1 else strict
+
+    monkeypatch.setattr(filters, "resolve_write_policy", changing_policy)
+    memory = Mnemosyne(session_id="mcp-triple-snapshot", db_path=tmp_path / "triple.db")
+    monkeypatch.setattr(mcp_tools, "_create_instance", lambda **_kwargs: memory)
+    try:
+        result = mcp_tools._handle_triple_add({
+            "subject": "memory-1",
+            "predicate": "mentions",
+            "object": "ISSUE821 admitted by the operation snapshot",
+        })
+        assert result["status"] == "added"
+        assert result["store"] == "annotations"
+        assert isinstance(result["annotation_id"], int)
+        assert resolutions == 1
+        rows = memory.beam.annotations.query_by_memory("memory-1", kind="mentions")
+        assert [row["value"] for row in rows] == [
+            "ISSUE821 admitted by the operation snapshot"
+        ]
+    finally:
+        memory.conn.close()

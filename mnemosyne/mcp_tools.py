@@ -720,63 +720,69 @@ def _handle_triple_add(arguments: Dict[str, Any]) -> Dict[str, Any]:
     _log = logging.getLogger("mnemosyne.mcp.triple_add")
 
     from mnemosyne.core.annotations import ANNOTATION_KINDS, AnnotationStore
-    from mnemosyne.core.filters import admit_memory_write
+    from mnemosyne.core.filters import (
+        admit_memory_write,
+        current_write_policy,
+        write_policy_operation,
+    )
     from mnemosyne.core.triples import TripleStore
 
-    predicate = arguments["predicate"]
-    annotation_path = isinstance(predicate, str) and predicate in ANNOTATION_KINDS
-    if not admit_memory_write(arguments["object"])[0]:
-        return {
-            "status": "filtered",
-            "store": "annotations" if annotation_path else "triples",
-        }
+    policy = current_write_policy()
+    with write_policy_operation(policy):
+        predicate = arguments["predicate"]
+        annotation_path = isinstance(predicate, str) and predicate in ANNOTATION_KINDS
+        if not admit_memory_write(arguments["object"], policy=policy)[0]:
+            return {
+                "status": "filtered",
+                "store": "annotations" if annotation_path else "triples",
+            }
 
-    if annotation_path:
+        if annotation_path:
+            bank = _resolve_bank(arguments)
+            mem = _create_instance(bank=bank)
+            db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
+            store = getattr(mem.beam, "annotations", None)
+            if store is None:
+                store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
+            valid_from = arguments.get("valid_from")
+            if predicate == "occurred_on" and valid_from:
+                row_id = store.add(
+                    memory_id=arguments["subject"],
+                    kind=predicate,
+                    value=arguments["object"],
+                    source=arguments.get("source", "conversation"),
+                    confidence=arguments.get("confidence", 1.0),
+                    valid_from=valid_from,
+                )
+            else:
+                if valid_from:
+                    _log.warning(
+                        "mnemosyne_triple_add: valid_from=%r provided with "
+                        "predicate=%r (not occurred_on); valid_from discarded.",
+                        valid_from, predicate,
+                    )
+                row_id = store.add(
+                    memory_id=arguments["subject"],
+                    kind=predicate,
+                    value=arguments["object"],
+                    source=arguments.get("source", "conversation"),
+                    confidence=arguments.get("confidence", 1.0),
+                )
+            return {"status": "added", "annotation_id": row_id, "store": "annotations"}
+
         bank = _resolve_bank(arguments)
         mem = _create_instance(bank=bank)
         db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-        store = getattr(mem.beam, "annotations", None)
-        if store is None:
-            store = AnnotationStore(db_path=db_path, conn=mem.beam.conn)
-        valid_from = arguments.get("valid_from")
-        if predicate == "occurred_on" and valid_from:
-            row_id = store.add(
-                memory_id=arguments["subject"],
-                kind=predicate,
-                value=arguments["object"],
-                source=arguments.get("source", "conversation"),
-                confidence=arguments.get("confidence", 1.0),
-                valid_from=valid_from,
-            )
-        else:
-            if valid_from:
-                _log.warning(
-                    "mnemosyne_triple_add: valid_from=%r provided with "
-                    "predicate=%r (not occurred_on); valid_from discarded.",
-                    valid_from, predicate,
-                )
-            row_id = store.add(
-                memory_id=arguments["subject"],
-                kind=predicate,
-                value=arguments["object"],
-                source=arguments.get("source", "conversation"),
-                confidence=arguments.get("confidence", 1.0),
-            )
-        return {"status": "added", "annotation_id": row_id, "store": "annotations"}
-
-    bank = _resolve_bank(arguments)
-    mem = _create_instance(bank=bank)
-    db_path = mem.beam.db_path if hasattr(mem.beam, "db_path") else mem.db_path
-    kg = TripleStore(db_path=db_path)
-    triple_id = kg.add(
-        subject=arguments["subject"],
-        predicate=predicate,
-        object=arguments["object"],
-        valid_from=arguments.get("valid_from"),
-        source=arguments.get("source", "conversation"),
-        confidence=arguments.get("confidence", 1.0),
-    )
-    return {"status": "added", "triple_id": triple_id, "store": "triples"}
+        kg = TripleStore(db_path=db_path)
+        triple_id = kg.add(
+            subject=arguments["subject"],
+            predicate=predicate,
+            object=arguments["object"],
+            valid_from=arguments.get("valid_from"),
+            source=arguments.get("source", "conversation"),
+            confidence=arguments.get("confidence", 1.0),
+        )
+        return {"status": "added", "triple_id": triple_id, "store": "triples"}
 
 
 def _handle_triple_query(arguments: Dict[str, Any]) -> Dict[str, Any]:
