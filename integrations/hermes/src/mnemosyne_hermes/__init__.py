@@ -2164,17 +2164,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         try:
             from mnemosyne.core.filters import write_policy_operation
 
-            # Retry/lazy initialization and session switches use this re-entrant
-            # lifecycle lock. Take it before resolving policy so the immutable
-            # snapshot and complete dispatch observe one provider/session state.
+            # Keep the private Beam/session stable for the operation, but hold
+            # the surface-adapter publication lock only while lazy initialization
+            # and policy capture observe one lifecycle generation. Long-running
+            # handlers must not prevent adapter invalidation/publication.
             with self._ensure_beam_access_lock():
-                self._maybe_retry_init()
-                self._ensure_initialized_for_tools()
-                policy_context = (
-                    write_policy_operation(self._resolve_effective_write_policy())
-                    if tool_name in self._WRITE_POLICY_TOOL_NAMES
-                    else nullcontext()
-                )
+                with self._ensure_surface_adapter_lock():
+                    self._maybe_retry_init()
+                    self._ensure_initialized_for_tools()
+                    policy_context = (
+                        write_policy_operation(self._resolve_effective_write_policy())
+                        if tool_name in self._WRITE_POLICY_TOOL_NAMES
+                        else nullcontext()
+                    )
                 with policy_context:
                     # Tools use the durable session selected by on_session_switch().
                     # Hold the same session lock for the complete dispatch so a write,
@@ -2427,17 +2429,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "tool": "mnemosyne_batch",
                     "action": action,
                 })
-                staged.append({"action": action, "pending_id": pid})
+                staged.append(pid)
                 results.append({
                     "index": op["index"], "action": action,
                     "status": "staged", "pending_id": pid,
                 })
             return json.dumps({
-                "status": "staged" if staged else "filtered", "staged": staged,
-                "staged_count": len(staged),
+                "status": "staged" if staged else "filtered",
+                "pending_ids": staged,
+                "count": len(staged),
                 "filtered_count": len(results) - len(staged),
                 "results": results,
-                "message": "Batch write staged for approval. Use mnemosyne_apply_pending to commit.",
+                "message": f"{len(staged)} writes staged for approval. Use mnemosyne_apply_pending to commit.",
             })
 
         return json.dumps(apply_beam_batch(
@@ -3751,21 +3754,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # Releasing a non-owner (skip context or failed initialization) is a no-op;
         # the final owner clears the global backend.
         self._release_host_llm_backend_ownership()
-        with self._ensure_surface_adapter_lock():
-            self._invalidate_surface_locked()
-        if self._memory is not None:
-            try:
-                self._memory.close()
-            except Exception:
-                logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
-        self._memory = None
-        if self._audit is not None:
-            try:
-                self._audit.close()
-            except Exception:
-                logger.debug("Mnemosyne: could not close audit log", exc_info=True)
-        self._audit = None
-        self._beam = None
+        with self._ensure_beam_access_lock():
+            with self._ensure_surface_adapter_lock():
+                self._invalidate_surface_locked()
+            if self._memory is not None:
+                try:
+                    self._memory.close()
+                except Exception:
+                    logger.debug("Mnemosyne: could not close wrapper", exc_info=True)
+            self._memory = None
+            if self._audit is not None:
+                try:
+                    self._audit.close()
+                except Exception:
+                    logger.debug("Mnemosyne: could not close audit log", exc_info=True)
+            self._audit = None
+            self._beam = None
 
         # C13: decrement this instance's contribution to the module-level
         # active-provider count. ``_provider_active`` stays True if other

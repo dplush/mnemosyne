@@ -1420,6 +1420,95 @@ def test_provider_sync_construction_race_retries_current_surface(
         assert shutdown == [surface_a, surface_b]
 
 
+def test_public_sync_dispatch_releases_publication_lock_and_retries_generation(
+    monkeypatch, provider_modules
+):
+    """A public dispatch must not publish an adapter for an invalidated surface."""
+    for name, module in provider_modules.items():
+        surface_a = object()
+        surface_b = object()
+        construction_started = threading.Event()
+        release_construction = threading.Event()
+        publication_acquired = threading.Event()
+        constructed = []
+        handled = []
+        shutdown = []
+        errors = []
+        result = []
+
+        class _Adapter:
+            def __init__(self, beam, _config):
+                self.beam = beam
+                constructed.append(beam)
+                if beam is surface_a:
+                    construction_started.set()
+                    assert release_construction.wait(5)
+
+            def handle_tool_call(self, _tool_name, _args):
+                handled.append(self.beam)
+                return "ok"
+
+            def shutdown(self):
+                shutdown.append(self.beam)
+
+        fake_sync_module = types.ModuleType(f"{name}.sync_adapter")
+        setattr(fake_sync_module, "SyncAdapter", _Adapter)
+        monkeypatch.setitem(sys.modules, f"{name}.sync_adapter", fake_sync_module)
+        provider = module.MnemosyneMemoryProvider()
+        provider._beam = types.SimpleNamespace(
+            session_id="stable-session", channel_id="stable-session"
+        )
+        provider._session_id = "stable-session"
+        provider._surface_beam = surface_a
+        provider.has_tool = lambda _tool_name: True
+        if name == "mnemosyne_hermes":
+            provider._maybe_retry_init = lambda: None
+            provider._ensure_initialized_for_tools = lambda: None
+
+        def dispatch() -> None:
+            try:
+                result.append(
+                    provider.handle_tool_call("mnemosyne_sync_status", {})
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        def invalidate_surface() -> None:
+            try:
+                with provider._ensure_surface_adapter_lock():
+                    provider._surface_generation += 1
+                    provider._surface_beam = surface_b
+                    publication_acquired.set()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        worker = threading.Thread(target=dispatch)
+        lifecycle = threading.Thread(target=invalidate_surface)
+        worker.start()
+        assert construction_started.wait(5)
+        lifecycle.start()
+        try:
+            assert publication_acquired.wait(2)
+        finally:
+            release_construction.set()
+            worker.join(5)
+            lifecycle.join(5)
+
+        assert not worker.is_alive()
+        assert not lifecycle.is_alive()
+        assert not errors
+        assert result == ["ok"]
+        assert constructed == [surface_a, surface_b]
+        assert handled == [surface_b]
+        assert shutdown == [surface_a]
+        cache_name = (
+            "_sync_adapter"
+            if name == "hermes_memory_provider"
+            else "_provider_sync_adapter"
+        )
+        assert getattr(provider, cache_name).beam is surface_b
+
+
 def test_standalone_sync_construction_race_retries_current_surface(
     monkeypatch, provider_modules
 ):

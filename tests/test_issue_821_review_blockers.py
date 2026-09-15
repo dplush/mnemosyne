@@ -678,28 +678,26 @@ pending_text = "\n".join(
     path.read_text(errors="replace") for path in pending_files if path.is_file()
 )
 approved_update_batch = json.loads(provider.handle_tool_call(
-    "mnemosyne_batch", {"operations": [{
-        "action": "update", "memory_id": allowed_id,
-        "content": "allowed approved update", "importance": 0.83,
-    }]}
+    "mnemosyne_batch", {"operations": [
+        {"action": "remember", "content": "allowed approved batch remember"},
+        {
+            "action": "update", "memory_id": allowed_id,
+            "content": "allowed approved update", "importance": 0.83,
+        },
+        {
+            "action": "invalidate", "memory_id": invalidate_id,
+            "replacement_id": replacement_id,
+        },
+    ]}
 ))
-approved_update_pending = approved_update_batch["results"][0]["pending_id"]
-approved_invalidate_batch = json.loads(provider.handle_tool_call(
-    "mnemosyne_batch", {"operations": [{
-        "action": "invalidate", "memory_id": invalidate_id,
-        "replacement_id": replacement_id,
-    }]}
-))
-approved_invalidate_pending = approved_invalidate_batch["results"][0]["pending_id"]
+approved_pending_ids = approved_update_batch["pending_ids"]
 unsupported_pending = module._stage_pending_write({
     "tool": "mnemosyne_batch", "action": "unsupported",
     "content": "allowed but unsupported",
 })
 approved_update_apply = json.loads(provider.handle_tool_call(
     "mnemosyne_apply_pending",
-    {"pending_ids": [
-        approved_update_pending, approved_invalidate_pending, unsupported_pending,
-    ]},
+    {"pending_ids": approved_pending_ids + [unsupported_pending]},
 ))
 non_content = json.loads(provider.handle_tool_call("mnemosyne_batch", {"operations": [
     {"action": "update", "memory_id": allowed_id, "importance": 0.9},
@@ -730,8 +728,7 @@ print(json.dumps({
     "apply_response": json.loads(apply_response),
     "approved_update_batch": approved_update_batch,
     "approved_update_apply": approved_update_apply,
-    "approved_invalidate_batch": approved_invalidate_batch,
-    "approved_invalidate_pending": approved_invalidate_pending,
+    "approved_pending_ids": approved_pending_ids,
     "unsupported_pending": unsupported_pending,
     "allowed_id": allowed_id,
     "invalidate_id": invalidate_id,
@@ -742,6 +739,14 @@ print(json.dumps({
     ).fetchone()[0],
     "allowed_rows": provider._beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE content = 'allowed pending content'"
+    ).fetchone()[0],
+    "approved_batch_remember_rows": provider._beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory "
+        "WHERE content = 'allowed approved batch remember'"
+    ).fetchone()[0],
+    "approved_batch_remember_id": provider._beam.conn.execute(
+        "SELECT id FROM working_memory "
+        "WHERE content = 'allowed approved batch remember'"
     ).fetchone()[0],
     "working_rows": provider._beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory"
@@ -783,29 +788,42 @@ def test_write_approval_rejects_before_pending_persistence(
     assert payload["pending_entries"] == []
     assert payload["original"] == "allowed approved update"
     assert payload["updated_importance"] == pytest.approx(0.83)
-    assert payload["approved_update_batch"]["results"][0]["status"] == "staged"
+    assert payload["approved_update_batch"]["status"] == "staged"
+    assert payload["approved_update_batch"]["count"] == 3
+    assert payload["approved_update_batch"]["filtered_count"] == 0
+    assert "staged" not in payload["approved_update_batch"]
+    assert "staged_count" not in payload["approved_update_batch"]
+    assert payload["approved_update_batch"]["message"] == (
+        "3 writes staged for approval. Use mnemosyne_apply_pending to commit."
+    )
+    assert payload["approved_update_batch"]["pending_ids"] == [
+        result["pending_id"] for result in payload["approved_update_batch"]["results"]
+    ]
+    assert all(
+        isinstance(pending_id, str)
+        for pending_id in payload["approved_update_batch"]["pending_ids"]
+    )
     assert payload["approved_update_apply"] == {
         "applied": [
             {
-                "id": payload["approved_update_batch"]["results"][0]["pending_id"],
+                "id": payload["approved_pending_ids"][0],
+                "memory_id": payload["approved_batch_remember_id"],
+            },
+            {
+                "id": payload["approved_pending_ids"][1],
                 "memory_id": payload["allowed_id"],
             },
             {
-                "id": payload["approved_invalidate_pending"],
+                "id": payload["approved_pending_ids"][2],
                 "memory_id": payload["invalidate_id"],
             },
         ],
         "failed": [{"id": payload["unsupported_pending"],
                     "error": "unsupported action"}],
-        "applied_count": 2,
+        "applied_count": 3,
         "failed_count": 1,
     }
-    assert payload["approved_invalidate_batch"]["results"] == [{
-        "index": 0,
-        "action": "invalidate",
-        "status": "staged",
-        "pending_id": payload["approved_invalidate_pending"],
-    }]
+    assert payload["approved_batch_remember_rows"] == 1
     assert payload["invalidation"]["valid_until"] is not None
     assert payload["invalidation"]["superseded_by"] == payload["replacement_id"]
     assert payload["non_content"]["status"] == "staged"
@@ -822,7 +840,7 @@ def test_write_approval_rejects_before_pending_persistence(
     assert payload["pending_after_apply"] == []
     assert payload["marker_rows"] == 0
     assert payload["allowed_rows"] == 1
-    assert payload["working_rows"] == 4
+    assert payload["working_rows"] == 5
     assert marker not in json.dumps(payload)
 
 
