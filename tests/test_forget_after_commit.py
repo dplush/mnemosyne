@@ -109,6 +109,14 @@ def test_hook_registered_by_hook_defers_to_next_commit(tmp_path: Path):
     mem.conn._after_commit_hooks.append(first)  # noqa: SLF001
     mem.conn.commit()
     assert fired == ["first"]
+    # A no-op commit (nothing open) must not fire the queued hook: only a
+    # real committed transaction drains.
+    mem.conn.commit()
+    assert fired == ["first"]
+    mem.conn.execute("BEGIN")
+    mem.conn.execute(
+        "INSERT INTO working_memory (id, content) VALUES ('re-row-2', 'x')"
+    )
     mem.conn.commit()
     assert fired == ["first", "second"]
 
@@ -155,15 +163,17 @@ def test_no_raw_transaction_ending_sql(tmp_path: Path):
     import re
 
     core = Path(__file__).resolve().parent.parent / "mnemosyne" / "core"
+    # Scan complete file content (not line-by-line) so a multiline
+    # execute("...") call cannot split the statement across the match.
     # ROLLBACK TO SAVEPOINT is excluded: it neither ends the transaction
-    # nor bypasses the hooks, unlike bare COMMIT / ROLLBACK / END.
+    # nor bypasses the hooks (\s also spans line breaks in the lookahead).
     pattern = re.compile(
         r"""execute\s*\(\s*['\"](COMMIT|END|ROLLBACK(?!\s+TO))\b""", re.IGNORECASE
     )
-    offenders = [
-        f"{p.name}:{i + 1}"
-        for p in sorted(core.glob("*.py"))
-        for i, line in enumerate(p.read_text().splitlines())
-        if pattern.search(line)
-    ]
+    offenders = []
+    for p in sorted(core.glob("*.py")):
+        text = p.read_text()
+        for m in pattern.finditer(text):
+            lineno = text.count("\n", 0, m.start()) + 1
+            offenders.append(f"{p.name}:{lineno}")
     assert offenders == []

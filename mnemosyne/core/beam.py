@@ -1949,8 +1949,13 @@ class _BeamConnection(sqlite3.Connection):
     def commit(self) -> None:
         if self._defer_commit:
             return
+        # Drain only when a transaction actually committed: a no-op
+        # commit with nothing open must not fire hooks queued for a
+        # transaction that never materialized.
+        had_transaction = self.in_transaction
         super().commit()
-        self._drain_after_commit_hooks()
+        if had_transaction:
+            self._drain_after_commit_hooks()
 
     def rollback(self) -> None:
         # Pending hooks describe uncommitted state: a rollback must never
@@ -1978,8 +1983,10 @@ class _BeamConnection(sqlite3.Connection):
     def _real_commit(self) -> None:
         """Force a real commit regardless of the defer flag.
         Used by `_deferred_commits` on successful exit."""
+        had_transaction = self.in_transaction
         super().commit()
-        self._drain_after_commit_hooks()
+        if had_transaction:
+            self._drain_after_commit_hooks()
 
 
 @contextlib.contextmanager
