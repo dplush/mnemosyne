@@ -589,13 +589,13 @@ def test_provider_sync_effective_config_and_raw_admission(
     pattern = "^ISSUE821"
     if case == "hermes":
         config = "memory:\n  mnemosyne:\n    ignore_patterns: ['^ISSUE821']\n    write_classifier: strict\n"
-        init_pattern, secret, expected = "", "ISSUE821 raw anchored", [pattern]
+        init_pattern, secret, expected, expected_mode = "", "ISSUE821 raw anchored", [pattern], "strict"
     elif case == "initialize":
         config = "memory:\n  mnemosyne: {}\n"
-        init_pattern, secret, expected = pattern, "ISSUE821 kwargs anchored", [pattern]
+        init_pattern, secret, expected, expected_mode = pattern, "ISSUE821 kwargs anchored", [pattern], "off"
     else:
         config = "memory:\n  mnemosyne:\n    write_classifier: strict\n"
-        init_pattern, secret, expected = "", "$ pip install requests --quiet", ["CONFLICT"]
+        init_pattern, secret, expected, expected_mode = "", "$ pip install requests --quiet", ["CONFLICT"], "strict"
     (home / "config.yaml").write_text(config)
     payload = _run(_SYNC_SCRIPT, {
         "PROVIDER": provider, "HERMES_HOME": str(home), "MNEMOSYNE_DATA_DIR": str(data),
@@ -605,7 +605,7 @@ def test_provider_sync_effective_config_and_raw_admission(
     })
     assert payload == {
         "rows": ["[ASSISTANT] allowed assistant response"], "same_env": True,
-        "mode": "strict", "patterns": expected,
+        "mode": expected_mode, "patterns": expected,
     }
 
 

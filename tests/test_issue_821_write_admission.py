@@ -105,7 +105,7 @@ elif os.environ["POLICY_SOURCE"] == "initialize_empty_string":
     init_kwargs.update(ignore_patterns="", write_classifier="off")
 provider.initialize("issue-821", **init_kwargs)
 assert provider._beam is not None
-marker = (
+marker = os.environ.get("CONTENT") or (
     "ISSUE821 I feel like a private gateway sentinel"
     if os.environ["GATEWAY"] == "sync_identity"
     else "ISSUE821 private gateway sentinel"
@@ -323,6 +323,49 @@ def test_empty_provider_patterns_override_conflicting_core_env(
     assert payload["count"] >= 1
     assert payload["patterns"] == []
     assert payload["response"]["status"] == "stored"
+
+
+@pytest.mark.parametrize("provider_module", ["hermes_memory_provider", "mnemosyne_hermes"])
+@pytest.mark.parametrize("write_classifier", [None, "off"])
+def test_provider_patterns_do_not_enable_write_classifier(
+    tmp_path: Path, provider_module: str, write_classifier: str | None
+):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    mode_config = (
+        "    write_classifier: off\n" if write_classifier is not None else ""
+    )
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n"
+        "  mnemosyne:\n"
+        "    ignore_patterns: ['^DO_NOT_MATCH']\n"
+        f"{mode_config}"
+    )
+
+    result = _run(
+        _GATEWAY_SCRIPT,
+        env={
+            "GATEWAY": "remember",
+            "POLICY_SOURCE": "hermes",
+            "PROVIDER_MODULE": provider_module,
+            "HERMES_HOME": str(hermes_home),
+            "MNEMOSYNE_DATA_DIR": str(data_dir),
+            "MNEMOSYNE_WRITE_CLASSIFIER": "off",
+            "MNEMOSYNE_IGNORE_PATTERNS": "",
+            "MNEMOSYNE_NO_EMBEDDINGS": "1",
+            "MNEMOSYNE_HOST_LLM_ENABLED": "0",
+            "SHARED_DB": str(tmp_path / "shared.db"),
+            "CONTENT": "$ pip install ISSUE821 --quiet",
+        },
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["mode"] == "off"
+    assert payload["patterns"] == ["^DO_NOT_MATCH"]
+    assert payload["response"]["status"] == "stored"
+    assert payload["count"] >= 1
 
 
 def test_direct_core_and_mcp_canonical_and_scratchpad_rejections_are_atomic(

@@ -1680,13 +1680,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             configured_mode = read_hermes_config_key(
                 getattr(self, "_hermes_home", None), "write_classifier"
             )
-        hermes_mode_explicit = configured_mode is not None
         if configured_mode is None:
             configured_mode = core_policy.classifier_mode
-        if self._ignore_patterns and not hermes_mode_explicit and configured_mode == "off":
-            # Provider ignore_patterns historically filtered sync_turn even
-            # before write_classifier existed.
-            configured_mode = "strict"
         self._write_policy = make_write_policy(self._ignore_patterns, configured_mode)
 
         # profile_isolation: separate DB per Hermes profile (bank-based).
