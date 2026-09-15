@@ -213,6 +213,8 @@ class CanonicalStore:
 
         Returns the resulting current row as a dict, with an added
         ``status`` key: ``"created"``, ``"unchanged"``, or ``"updated"``.
+        Returns ``None`` when the current write policy rejects ``body``;
+        policy rejection does not modify the canonical slot or its history.
 
         Raises ``ValueError`` if owner_id / category / name / body is empty —
         the slot key and value must all be non-blank for the uniqueness

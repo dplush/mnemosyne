@@ -3558,6 +3558,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             })
         if self._beam.episodic_graph is None:
             return json.dumps({"error": "Episodic graph not available"})
+        from mnemosyne.core.filters import admit_memory_write
+
+        if not admit_memory_write(
+            relationship,
+            write_kind="public",
+            policy=self._current_operation_write_policy(),
+        )[0]:
+            return json.dumps({"status": "filtered"})
         GraphEdge = _get_graph_edge_class()
         edge = GraphEdge(
             source=source_id,

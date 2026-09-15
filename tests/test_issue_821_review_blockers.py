@@ -1422,6 +1422,36 @@ def test_media_moments_are_admitted_before_store_and_bind(tmp_path: Path, monkey
         beam.conn.close()
 
 
+def test_media_summary_filtered_by_policy_is_unavailable(tmp_path: Path, monkeypatch):
+    from mnemosyne.core import media
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import WritePolicySnapshot
+    from mnemosyne.core.modality_backends import DescribeResult
+
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    monkeypatch.setattr(
+        media,
+        "_describe",
+        lambda *_args, **_kwargs: DescribeResult(
+            provider="stub",
+            summary="ISSUE821 blocked summary",
+        ),
+    )
+    beam = BeamMemory(session_id="filtered-summary", db_path=tmp_path / "summary.db")
+    try:
+        result = beam.remember_media(
+            "https://example.test/allowed-summary.png",
+            _write_policy=strict,
+        )
+        assert result.status == "unavailable"
+        assert result.moment_ids == []
+        assert result.memory_ids == []
+        assert beam.media.get_moments(result.asset_id) == []
+        assert any("write policy" in warning for warning in result.warnings)
+    finally:
+        beam.conn.close()
+
+
 def test_system_derived_media_moments_preserve_exemption(tmp_path: Path, monkeypatch):
     from mnemosyne.core import media
     from mnemosyne.core.beam import BeamMemory
@@ -1480,6 +1510,7 @@ def test_update_filtered_result_typing_and_user_surfaces(
         == optional_str
     )
     assert typing.get_type_hints(Mnemosyne.remember)["return"] == optional_str
+    assert typing.get_type_hints(memory_module.remember)["return"] == optional_str
     assert typing.get_type_hints(BeamMemory.update_working)["return"] == optional_bool
     assert typing.get_type_hints(Mnemosyne.update)["return"] == optional_bool
     assert typing.get_type_hints(memory_module.update)["return"] == optional_bool

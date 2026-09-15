@@ -100,6 +100,70 @@ def _filtered_schemas(module, names: list[str]):
     return [schemas[name] for name in names]
 
 
+def test_graph_link_write_admission_provider_parity(
+    tmp_path, monkeypatch, provider_modules
+):
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"graph-link-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+            ignore_patterns=[r"^ISSUE821"],
+            write_classifier="strict",
+        )
+        assert provider._beam is not None
+        original_resolve = provider._resolve_effective_write_policy
+        resolutions = 0
+
+        def resolve_once():
+            nonlocal resolutions
+            resolutions += 1
+            return original_resolve()
+
+        provider._resolve_effective_write_policy = resolve_once
+        rejected_source = f"source-rejected-{name}"
+        rejected_target = f"target-rejected-{name}"
+        allowed_source = f"ISSUE821 source identifier {name}"
+        allowed_target = f"ISSUE821 target identifier {name}"
+        try:
+            rejected = json.loads(provider.handle_tool_call(
+                "mnemosyne_graph_link",
+                {
+                    "source_id": rejected_source,
+                    "target_id": rejected_target,
+                    "relationship": "ISSUE821 blocked relationship",
+                },
+            ))
+            assert rejected == {"status": "filtered"}
+            assert provider._beam.episodic_graph.find_related_memories(
+                rejected_source, depth=1
+            ) == []
+
+            allowed = json.loads(provider.handle_tool_call(
+                "mnemosyne_graph_link",
+                {
+                    "source_id": allowed_source,
+                    "target_id": allowed_target,
+                    "relationship": "references",
+                },
+            ))
+            assert allowed["status"] == "linked"
+            assert allowed["source"] == allowed_source
+            assert allowed["target"] == allowed_target
+            assert allowed["relationship"] == "references"
+            related = provider._beam.episodic_graph.find_related_memories(
+                allowed_source, depth=1
+            )
+            assert [row["memory_id"] for row in related] == [allowed_target]
+            assert resolutions == 2
+        finally:
+            provider.shutdown()
+
+
 PROVIDER_TOOL_NAMES = [
     "mnemosyne_remember", "mnemosyne_recall", "mnemosyne_shared_remember",
     "mnemosyne_shared_recall", "mnemosyne_shared_forget", "mnemosyne_shared_stats",

@@ -1354,7 +1354,7 @@ def remember(content: str, source: str = "conversation",
              extract_entities: bool = False,
              extract: bool = False, bank: str = None,
              trust_tier: str = None,
-             veracity: str = "unknown") -> str:
+             veracity: str = "unknown") -> Optional[str]:
     """Store a memory using the global instance"""
     return _get_default(bank).remember(content, source, importance, metadata,
                                        scope=scope, valid_until=valid_until,

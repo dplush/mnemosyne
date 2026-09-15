@@ -1450,7 +1450,7 @@ def remember_media(
         drafts = admitted_drafts
 
         if not drafts:
-            status = "partial" if result.summary else "unavailable"
+            status = "unavailable"
             return MediaIngestResult(
                 asset_id=asset_id, anchor_memory_id=anchor_memory_id,
                 status=status, warnings=warnings,
