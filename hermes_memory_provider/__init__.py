@@ -3718,7 +3718,6 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         continue
                     if not updated:
                         failed.append({"id": pid, "error": "memory not found"})
-                        record_path.unlink(missing_ok=True)
                         continue
                 elif action == "forget":
                     memory_id = str(payload.get("memory_id") or "").strip()
@@ -3736,12 +3735,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         failed.append({"id": pid, "error": "memory_id is required"})
                         record_path.unlink(missing_ok=True)
                         continue
-                    if not self._beam.invalidate(
+                    invalidated = self._beam.invalidate(
                         memory_id,
                         replacement_id=payload.get("replacement_id") or None,
-                    ):
+                    )
+                    if not invalidated:
                         failed.append({"id": pid, "error": "memory not found"})
-                        record_path.unlink(missing_ok=True)
+                        # ``invalidate`` returns False both when the target is
+                        # already absent (terminal/idempotent) and when a live
+                        # target cannot yet use its requested replacement.
+                        # Retain only the latter so it can be retried.
+                        if self._beam.get(memory_id) is None:
+                            record_path.unlink(missing_ok=True)
                         continue
                 else:
                     failed.append({"id": pid, "error": "unsupported action"})

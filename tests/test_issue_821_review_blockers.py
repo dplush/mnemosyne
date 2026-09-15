@@ -844,6 +844,205 @@ def test_write_approval_rejects_before_pending_persistence(
     assert marker not in json.dumps(payload)
 
 
+_PENDING_RETRY_SCRIPT = r"""
+import importlib, json, os, sys, types
+from pathlib import Path
+
+h = types.ModuleType("hermes_constants")
+h.get_hermes_home = lambda: Path(os.environ["HERMES_HOME"])
+sys.modules.setdefault("hermes_constants", h)
+hc = types.ModuleType("hermes_cli.config")
+hc.load_config = lambda: {"memory": {"write_approval": True}}
+hc.cfg_get = lambda cfg, *keys, default=None: (
+    cfg.get(keys[0], {}).get(keys[1], default) if len(keys) == 2 else default
+)
+hp = types.ModuleType("hermes_cli")
+hp.__path__ = []
+hp.config = hc
+sys.modules.setdefault("hermes_cli", hp)
+sys.modules.setdefault("hermes_cli.config", hc)
+
+module = importlib.import_module(os.environ["PROVIDER"])
+provider = module.MnemosyneMemoryProvider()
+provider.initialize(
+    "issue821-pending-retry",
+    hermes_home=os.environ["HERMES_HOME"],
+    auto_sleep=False,
+)
+pending_dir = Path(os.environ["HERMES_HOME"]) / "pending" / "memory"
+
+
+def stage(action, memory_id, **payload):
+    return module._stage_pending_write({
+        "tool": "mnemosyne_batch",
+        "action": action,
+        "memory_id": memory_id,
+        **payload,
+    })
+
+
+def apply(pending_id):
+    return json.loads(provider.handle_tool_call(
+        "mnemosyne_apply_pending", {"pending_ids": [pending_id]}
+    ))
+
+
+def exists(pending_id):
+    return (pending_dir / f"{pending_id}.json").is_file()
+
+
+update_target = "pendingupdatetarget"
+update_pending = stage("update", update_target, content="updated after retry")
+update_missing = apply(update_pending)
+update_retained = exists(update_pending)
+provider._beam.remember(
+    "original before retry", memory_id=update_target, dedupe=False
+)
+update_retried = apply(update_pending)
+update_cleaned = not exists(update_pending)
+update_content = provider._beam.get(update_target)["content"]
+
+forget_target = "pendingforgettarget"
+provider._beam.remember("forget once", memory_id=forget_target, dedupe=False)
+forget_pending = stage("forget", forget_target)
+forget_applied = apply(forget_pending)
+forget_cleaned = not exists(forget_pending)
+forget_again_pending = stage("forget", forget_target)
+forget_already_satisfied = apply(forget_again_pending)
+forget_terminal_cleaned = not exists(forget_again_pending)
+
+forget_transient_target = "pendingforgettransient"
+provider._beam.remember(
+    "forget after transient failure", memory_id=forget_transient_target, dedupe=False
+)
+forget_transient_pending = stage("forget", forget_transient_target)
+original_forget = provider._beam.forget_working
+
+def temporary_forget_failure(_memory_id):
+    raise RuntimeError("temporary forget failure")
+
+provider._beam.forget_working = temporary_forget_failure
+forget_transient = apply(forget_transient_pending)
+forget_transient_retained = exists(forget_transient_pending)
+provider._beam.forget_working = original_forget
+forget_retried = apply(forget_transient_pending)
+forget_retry_cleaned = not exists(forget_transient_pending)
+
+invalidate_missing_pending = stage("invalidate", "pendinginvalidatemissing")
+invalidate_missing = apply(invalidate_missing_pending)
+invalidate_terminal_cleaned = not exists(invalidate_missing_pending)
+
+invalidate_target = "pendinginvalidatetarget"
+invalidate_replacement = "pendinginvalidatereplacement"
+provider._beam.remember(
+    "invalidate after replacement appears", memory_id=invalidate_target, dedupe=False
+)
+invalidate_pending = stage(
+    "invalidate", invalidate_target, replacement_id=invalidate_replacement
+)
+invalidate_replacement_missing = apply(invalidate_pending)
+invalidate_retained = exists(invalidate_pending)
+provider._beam.remember(
+    "replacement appears", memory_id=invalidate_replacement, dedupe=False
+)
+invalidate_retried = apply(invalidate_pending)
+invalidate_retry_cleaned = not exists(invalidate_pending)
+invalidate_row = dict(provider._beam.conn.execute(
+    "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+    (invalidate_target,),
+).fetchone())
+
+print(json.dumps({
+    "update_missing": update_missing,
+    "update_retained": update_retained,
+    "update_retried": update_retried,
+    "update_cleaned": update_cleaned,
+    "update_content": update_content,
+    "forget_applied": forget_applied,
+    "forget_cleaned": forget_cleaned,
+    "forget_already_satisfied": forget_already_satisfied,
+    "forget_terminal_cleaned": forget_terminal_cleaned,
+    "forget_transient": forget_transient,
+    "forget_transient_retained": forget_transient_retained,
+    "forget_retried": forget_retried,
+    "forget_retry_cleaned": forget_retry_cleaned,
+    "invalidate_missing": invalidate_missing,
+    "invalidate_terminal_cleaned": invalidate_terminal_cleaned,
+    "invalidate_replacement_missing": invalidate_replacement_missing,
+    "invalidate_retained": invalidate_retained,
+    "invalidate_retried": invalidate_retried,
+    "invalidate_retry_cleaned": invalidate_retry_cleaned,
+    "invalidate_row": invalidate_row,
+    "pending_files": sorted(path.name for path in pending_dir.glob("*.json")),
+}))
+"""
+
+
+@pytest.mark.parametrize("provider", ["hermes_memory_provider", "mnemosyne_hermes"])
+def test_pending_mutation_retry_and_terminal_cleanup(
+    tmp_path: Path, provider: str
+):
+    home = tmp_path / "hermes"
+    data = tmp_path / "data"
+    home.mkdir(); data.mkdir()
+    payload = _run(_PENDING_RETRY_SCRIPT, {
+        "PROVIDER": provider,
+        "HERMES_HOME": str(home),
+        "MNEMOSYNE_DATA_DIR": str(data),
+        "MNEMOSYNE_NO_EMBEDDINGS": "1",
+        "MNEMOSYNE_HOST_LLM_ENABLED": "0",
+    })
+
+    update_pending_id = payload["update_missing"]["failed"][0]["id"]
+    assert payload["update_missing"] == {
+        "applied": [],
+        "failed": [{"id": update_pending_id, "error": "memory not found"}],
+        "applied_count": 0,
+        "failed_count": 1,
+    }
+    assert payload["update_retained"] is True
+    assert payload["update_retried"] == {
+        "applied": [{"id": update_pending_id, "memory_id": "pendingupdatetarget"}],
+        "failed": [],
+        "applied_count": 1,
+        "failed_count": 0,
+    }
+    assert payload["update_cleaned"] is True
+    assert payload["update_content"] == "updated after retry"
+
+    assert payload["forget_applied"]["applied_count"] == 1
+    assert payload["forget_cleaned"] is True
+    assert payload["forget_already_satisfied"]["applied"] == []
+    assert payload["forget_already_satisfied"]["failed"][0]["error"] == (
+        "memory not found"
+    )
+    assert payload["forget_terminal_cleaned"] is True
+    assert payload["forget_transient"]["failed"][0]["error"] == (
+        "temporary forget failure"
+    )
+    assert payload["forget_transient_retained"] is True
+    assert payload["forget_retried"]["applied_count"] == 1
+    assert payload["forget_retry_cleaned"] is True
+
+    assert payload["invalidate_missing"]["applied"] == []
+    assert payload["invalidate_missing"]["failed"][0]["error"] == (
+        "memory not found"
+    )
+    assert payload["invalidate_terminal_cleaned"] is True
+    assert payload["invalidate_replacement_missing"]["applied"] == []
+    assert payload["invalidate_replacement_missing"]["failed"][0]["error"] == (
+        "memory not found"
+    )
+    assert payload["invalidate_retained"] is True
+    assert payload["invalidate_retried"]["applied_count"] == 1
+    assert payload["invalidate_retry_cleaned"] is True
+    assert payload["invalidate_row"]["valid_until"] is not None
+    assert payload["invalidate_row"]["superseded_by"] == (
+        "pendinginvalidatereplacement"
+    )
+    assert payload["pending_files"] == []
+
+
 def test_facade_data_uri_is_admitted_before_blob_or_sql_mutation(
     tmp_path: Path, monkeypatch
 ):
