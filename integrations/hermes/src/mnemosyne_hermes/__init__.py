@@ -2164,34 +2164,38 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         try:
             from mnemosyne.core.filters import write_policy_operation
 
-            self._maybe_retry_init()
-            self._ensure_initialized_for_tools()
-            policy_context = (
-                write_policy_operation(self._resolve_effective_write_policy())
-                if tool_name in self._WRITE_POLICY_TOOL_NAMES
-                else nullcontext()
-            )
-            with policy_context:
-                # Tools use the durable session selected by on_session_switch().
-                # Hold the same session lock for the complete dispatch so a write,
-                # recall, or sleep cannot be re-attributed mid-operation.
-                with self._beam_session_scope("") as beam:
-                    if beam is None:
-                        # C27: structured response carries the actual failure reason
-                        # instead of a generic "not initialized" string. Status field
-                        # is parseable by tool consumers; `reason` is human-readable for
-                        # the agent to relay to the user. The `error` field is kept
-                        # alongside `status` so callers using the prior "if 'error' in
-                        # payload" pattern (codex review finding #4) don't silently
-                        # misclassify unavailable as success.
-                        reason = self._init_error_reason()
-                        return json.dumps({
-                            "status": "memory_unavailable",
-                            "tool": tool_name,
-                            "reason": reason,
-                            "error": f"Mnemosyne unavailable: {reason}",
-                        })
-                    return self._dispatch_tool_call_locked(tool_name, args)
+            # Retry/lazy initialization and session switches use this re-entrant
+            # lifecycle lock. Take it before resolving policy so the immutable
+            # snapshot and complete dispatch observe one provider/session state.
+            with self._ensure_beam_access_lock():
+                self._maybe_retry_init()
+                self._ensure_initialized_for_tools()
+                policy_context = (
+                    write_policy_operation(self._resolve_effective_write_policy())
+                    if tool_name in self._WRITE_POLICY_TOOL_NAMES
+                    else nullcontext()
+                )
+                with policy_context:
+                    # Tools use the durable session selected by on_session_switch().
+                    # Hold the same session lock for the complete dispatch so a write,
+                    # recall, or sleep cannot be re-attributed mid-operation.
+                    with self._beam_session_scope("") as beam:
+                        if beam is None:
+                            # C27: structured response carries the actual failure reason
+                            # instead of a generic "not initialized" string. Status field
+                            # is parseable by tool consumers; `reason` is human-readable for
+                            # the agent to relay to the user. The `error` field is kept
+                            # alongside `status` so callers using the prior "if 'error' in
+                            # payload" pattern (codex review finding #4) don't silently
+                            # misclassify unavailable as success.
+                            reason = self._init_error_reason()
+                            return json.dumps({
+                                "status": "memory_unavailable",
+                                "tool": tool_name,
+                                "reason": reason,
+                                "error": f"Mnemosyne unavailable: {reason}",
+                            })
+                        return self._dispatch_tool_call_locked(tool_name, args)
         except Exception as e:
             logger.error("Mnemosyne tool %s failed: %s", tool_name, e)
             return json.dumps({"error": f"Mnemosyne tool '{tool_name}' failed: {e}"})

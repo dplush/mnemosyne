@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -997,6 +999,105 @@ def test_lazy_tool_initialization_precedes_policy_snapshot():
 
     assert result == {"mode": "strict"}
     assert calls == ["retry", "ensure", "resolve", "dispatch"]
+
+
+@pytest.mark.parametrize(
+    ("provider_module", "dispatch_name"),
+    [
+        ("hermes_memory_provider", "_dispatch_tool_call"),
+        ("mnemosyne_hermes", "_dispatch_tool_call_locked"),
+    ],
+)
+def test_provider_write_dispatch_policy_and_session_share_lifecycle_lock(
+    provider_module: str, dispatch_name: str
+):
+    """A lifecycle transition cannot split policy resolution from dispatch."""
+    import importlib
+
+    from mnemosyne.core.filters import WritePolicySnapshot, current_write_policy
+
+    module = importlib.import_module(provider_module)
+    provider = module.MnemosyneMemoryProvider()
+    old_policy = WritePolicySnapshot((), "off")
+    new_policy = WritePolicySnapshot((r"^LIFECYCLE821",), "strict")
+    provider._write_policy = old_policy
+    provider._session_id = "old-session"
+    provider._beam = types.SimpleNamespace(
+        session_id="old-session", channel_id="old-session"
+    )
+    provider.has_tool = lambda _name: True
+    lifecycle_started = threading.Event()
+    release_lifecycle = threading.Event()
+    policy_resolved = threading.Event()
+    errors: list[BaseException] = []
+    result: list[str] = []
+
+    def initialize_locked(_session_id: str, **_kwargs) -> None:
+        lifecycle_started.set()
+        if not release_lifecycle.wait(timeout=5):
+            raise AssertionError("timed out waiting to finish lifecycle transition")
+        provider._write_policy = new_policy
+        provider._session_id = "new-session"
+        provider._beam.session_id = "new-session"
+        provider._beam.channel_id = "new-session"
+
+    provider._initialize_locked = initialize_locked
+    if provider_module == "mnemosyne_hermes":
+        provider._maybe_retry_init = lambda: None
+        provider._ensure_initialized_for_tools = lambda: None
+
+    def resolve_policy():
+        policy_resolved.set()
+        return provider._write_policy
+
+    provider._resolve_effective_write_policy = resolve_policy
+
+    def dispatch(_tool_name: str, _args: dict, **_kwargs) -> str:
+        return json.dumps(
+            {
+                "mode": current_write_policy().classifier_mode,
+                "session_id": provider._session_id,
+                "beam_session_id": provider._beam.session_id,
+            }
+        )
+
+    setattr(provider, dispatch_name, dispatch)
+
+    def run_initialize() -> None:
+        try:
+            provider.initialize("new-session")
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def run_dispatch() -> None:
+        try:
+            result.append(provider.handle_tool_call("mnemosyne_remember", {}))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    lifecycle = threading.Thread(target=run_initialize)
+    dispatch_thread = threading.Thread(target=run_dispatch)
+    lifecycle.start()
+    assert lifecycle_started.wait(timeout=5)
+    dispatch_thread.start()
+    try:
+        assert not policy_resolved.wait(timeout=0.1)
+    finally:
+        release_lifecycle.set()
+        lifecycle.join(timeout=5)
+        dispatch_thread.join(timeout=5)
+
+    assert not lifecycle.is_alive()
+    assert not dispatch_thread.is_alive()
+    assert not errors
+    assert policy_resolved.is_set()
+    assert [json.loads(item) for item in result] == [
+        {
+            "mode": "strict",
+            "session_id": "new-session",
+            "beam_session_id": "new-session",
+        }
+    ]
 
 
 @pytest.mark.parametrize(

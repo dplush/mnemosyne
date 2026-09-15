@@ -2715,13 +2715,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         from mnemosyne.core.filters import write_policy_operation
 
-        policy_context = (
-            write_policy_operation(self._resolve_effective_write_policy())
-            if tool_name in self._WRITE_POLICY_TOOL_NAMES
-            else nullcontext()
-        )
-        with policy_context:
-            return self._dispatch_tool_call(tool_name, args, **kwargs)
+        # Initialization replaces the active Beam while holding this lifecycle
+        # lock. Resolve the write policy inside the same boundary so one public
+        # dispatch cannot pair pre-initialization policy with post-initialization
+        # provider state.
+        with self._ensure_surface_adapter_lock():
+            policy_context = (
+                write_policy_operation(self._resolve_effective_write_policy())
+                if tool_name in self._WRITE_POLICY_TOOL_NAMES
+                else nullcontext()
+            )
+            with policy_context:
+                return self._dispatch_tool_call(tool_name, args, **kwargs)
 
     def _dispatch_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         try:
