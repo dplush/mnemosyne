@@ -2539,12 +2539,9 @@ def _store_facts_in_table(beam: "BeamMemory", memory_id: str,
     
     from mnemosyne.core.filters import admit_memory_write
 
-    admitted_facts = [
-        fact_text
-        for fact_text in facts
-        if admit_memory_write(fact_text, policy=write_policy)[0]
-    ]
-    for i, fact_text in enumerate(admitted_facts):
+    for i, fact_text in enumerate(facts):
+        if not admit_memory_write(fact_text, policy=write_policy)[0]:
+            continue
         # Derive subject from source, predicate = "stated", object = fact text
         subject = source or "user"
         fact_id = hashlib.sha256(
@@ -5394,7 +5391,10 @@ class BeamMemory:
                     )
 
             # Auto-generate temporal triple
-            self._add_temporal_triple(memory_id, timestamp, source, content)
+            self._add_temporal_triple(
+                memory_id, timestamp, source, content,
+                _write_kind=_write_kind, _write_policy=write_policy,
+            )
 
             # --- Temporal extraction ---
             if extract_temporal is not None:
@@ -5702,7 +5702,8 @@ class BeamMemory:
                 row_content = row["content"] if hasattr(row, "keys") else row[0]
                 row_timestamp = row["timestamp"] if hasattr(row, "keys") else row[1]
                 self._add_temporal_triple(
-                    memory_id, row_timestamp, item_source, row_content
+                    memory_id, row_timestamp, item_source, row_content,
+                    _write_policy=policy,
                 )
                 self._ingest_graph_and_veracity(
                     memory_id, row_content, item_source, item_veracity
@@ -5900,7 +5901,10 @@ class BeamMemory:
             logger.debug("Proactive linking outer wrapper failed for %s", memory_id, exc_info=True)
             # Non-blocking — never surface to caller
 
-    def _add_temporal_triple(self, memory_id: str, timestamp: str, source: str, content: str):
+    def _add_temporal_triple(
+        self, memory_id: str, timestamp: str, source: str, content: str, *,
+        _write_kind: object = "public", _write_policy=None,
+    ):
         """Auto-generate temporal annotations for a memory.
 
         Post-E6: writes occurred_on / has_source as annotations rather
@@ -5916,6 +5920,8 @@ class BeamMemory:
                 memory_id=memory_id,
                 kind="occurred_on",
                 value=date_str,
+                _write_kind=_write_kind,
+                _write_policy=_write_policy,
             )
             # Also tag source type
             if source and source not in ("conversation", "user", "assistant"):
@@ -5923,6 +5929,8 @@ class BeamMemory:
                     memory_id=memory_id,
                     kind="has_source",
                     value=source,
+                    _write_kind=_write_kind,
+                    _write_policy=_write_policy,
                 )
         except Exception:
             # Annotation writes are optional; don't fail memory write if they fail

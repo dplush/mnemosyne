@@ -3655,6 +3655,19 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         failed.append({"id": pid, "error": "memory not found"})
                         record_path.unlink(missing_ok=True)
                         continue
+                elif action == "invalidate":
+                    memory_id = str(payload.get("memory_id") or "").strip()
+                    if not memory_id:
+                        failed.append({"id": pid, "error": "memory_id is required"})
+                        record_path.unlink(missing_ok=True)
+                        continue
+                    if not self._beam.invalidate(
+                        memory_id,
+                        replacement_id=payload.get("replacement_id") or None,
+                    ):
+                        failed.append({"id": pid, "error": "memory not found"})
+                        record_path.unlink(missing_ok=True)
+                        continue
                 else:
                     failed.append({"id": pid, "error": "unsupported action"})
                     record_path.unlink(missing_ok=True)

@@ -236,13 +236,18 @@ class AnnotationStore:
         value: str,
         source: str = "",
         confidence: float = 1.0,
+        *,
+        _write_kind: object = "public",
+        _write_policy=None,
     ) -> int | None:
         """Append an annotation row. Returns the new row id when admitted.
 
         No invalidation of prior rows — multiple values for the same
         (memory_id, kind) coexist and are all returned by query methods.
         """
-        if not _admit_annotation_values([value]):
+        if not _admit_annotation_values(
+            [value], write_kind=_write_kind, write_policy=_write_policy
+        ):
             return None
 
         cursor = self.conn.cursor()

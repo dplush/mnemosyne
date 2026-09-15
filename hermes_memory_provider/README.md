@@ -34,7 +34,7 @@ memory:
     auto_sleep: true
     sleep_threshold: 50
     vector_type: float32  # float32 | int8 | bit
-    write_classifier: off  # off | warn | strict
+    write_classifier: "off"  # off | warn | strict
 ```
 
 `write_classifier` controls admission for explicit writes and autosaved turns.

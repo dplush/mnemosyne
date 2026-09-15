@@ -108,24 +108,33 @@ def test_file_import_restore_exemption_and_null_accounting(tmp_path: Path):
     from mnemosyne.core.memory import Mnemosyne
 
     source = tmp_path / "restore.json"
-    source.write_text(json.dumps([{"content": "ISSUE821 restored row"}]))
+    source.write_text(json.dumps([
+        {"content": ""},
+        {"content": "allowed restored row"},
+        {"content": "ISSUE821 restored row"},
+    ]))
     memory = Mnemosyne(session_id="restore", db_path=tmp_path / "restore.db")
     strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
     try:
         with write_policy_operation(strict):
             result = import_from_file(str(source), memory)
-        assert result.imported == 1 and result.skipped == 0
-        assert len(result.memory_ids) == 1 and result.memory_ids[0]
-        assert memory.beam.get(result.memory_ids[0])["content"] == "ISSUE821 restored row"
+        assert (result.total, result.imported, result.skipped, result.failed) == (3, 2, 0, 0)
+        assert len(result.memory_ids) == 2 and all(result.memory_ids)
+        assert {
+            memory.beam.get(memory_id)["content"] for memory_id in result.memory_ids
+        } == {"allowed restored row", "ISSUE821 restored row"}
     finally:
         memory.conn.close()
 
     class RejectingMemory:
-        def remember(self, **_kwargs):
-            return None
+        def remember(self, **kwargs):
+            return None if kwargs["content"].startswith("ISSUE821") else "allowed-id"
 
     rejected = import_from_file(str(source), RejectingMemory())
-    assert (rejected.imported, rejected.skipped, rejected.memory_ids) == (0, 1, [])
+    assert (rejected.total, rejected.imported, rejected.skipped, rejected.failed) == (
+        3, 1, 1, 0,
+    )
+    assert rejected.memory_ids == ["allowed-id"]
 
 
 def test_update_boundary_provider_batch_and_importance_only(tmp_path: Path):
@@ -639,6 +648,12 @@ provider.initialize(
 allowed_id = provider._beam.remember(
     "allowed original", _write_policy=type(provider._write_policy)((), "off")
 )
+invalidate_id = provider._beam.remember(
+    "allowed invalidate target", _write_policy=type(provider._write_policy)((), "off")
+)
+replacement_id = provider._beam.remember(
+    "allowed replacement", _write_policy=type(provider._write_policy)((), "off")
+)
 
 class Capture(logging.Handler):
     def __init__(self):
@@ -667,13 +682,22 @@ approved_update_batch = json.loads(provider.handle_tool_call(
     }]}
 ))
 approved_update_pending = approved_update_batch["results"][0]["pending_id"]
+approved_invalidate_batch = json.loads(provider.handle_tool_call(
+    "mnemosyne_batch", {"operations": [{
+        "action": "invalidate", "memory_id": invalidate_id,
+        "replacement_id": replacement_id,
+    }]}
+))
+approved_invalidate_pending = approved_invalidate_batch["results"][0]["pending_id"]
 unsupported_pending = module._stage_pending_write({
     "tool": "mnemosyne_batch", "action": "unsupported",
     "content": "allowed but unsupported",
 })
 approved_update_apply = json.loads(provider.handle_tool_call(
     "mnemosyne_apply_pending",
-    {"pending_ids": [approved_update_pending, unsupported_pending]},
+    {"pending_ids": [
+        approved_update_pending, approved_invalidate_pending, unsupported_pending,
+    ]},
 ))
 non_content = json.loads(provider.handle_tool_call("mnemosyne_batch", {"operations": [
     {"action": "update", "memory_id": allowed_id, "importance": 0.9},
@@ -704,8 +728,12 @@ print(json.dumps({
     "apply_response": json.loads(apply_response),
     "approved_update_batch": approved_update_batch,
     "approved_update_apply": approved_update_apply,
+    "approved_invalidate_batch": approved_invalidate_batch,
+    "approved_invalidate_pending": approved_invalidate_pending,
     "unsupported_pending": unsupported_pending,
     "allowed_id": allowed_id,
+    "invalidate_id": invalidate_id,
+    "replacement_id": replacement_id,
     "pending_after_apply": [str(path) for path in pending_root.rglob("*.json")],
     "marker_rows": provider._beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%ISSUE821%'"
@@ -719,6 +747,10 @@ print(json.dumps({
     "logs": capture.messages,
     "original": provider._beam.get(allowed_id)["content"],
     "updated_importance": provider._beam.get(allowed_id)["importance"],
+    "invalidation": dict(provider._beam.conn.execute(
+        "SELECT valid_until, superseded_by FROM working_memory WHERE id = ?",
+        (invalidate_id,),
+    ).fetchone()),
 }))
 """
 
@@ -751,15 +783,29 @@ def test_write_approval_rejects_before_pending_persistence(
     assert payload["updated_importance"] == pytest.approx(0.83)
     assert payload["approved_update_batch"]["results"][0]["status"] == "staged"
     assert payload["approved_update_apply"] == {
-        "applied": [{
-            "id": payload["approved_update_batch"]["results"][0]["pending_id"],
-            "memory_id": payload["allowed_id"],
-        }],
+        "applied": [
+            {
+                "id": payload["approved_update_batch"]["results"][0]["pending_id"],
+                "memory_id": payload["allowed_id"],
+            },
+            {
+                "id": payload["approved_invalidate_pending"],
+                "memory_id": payload["invalidate_id"],
+            },
+        ],
         "failed": [{"id": payload["unsupported_pending"],
                     "error": "unsupported action"}],
-        "applied_count": 1,
+        "applied_count": 2,
         "failed_count": 1,
     }
+    assert payload["approved_invalidate_batch"]["results"] == [{
+        "index": 0,
+        "action": "invalidate",
+        "status": "staged",
+        "pending_id": payload["approved_invalidate_pending"],
+    }]
+    assert payload["invalidation"]["valid_until"] is not None
+    assert payload["invalidation"]["superseded_by"] == payload["replacement_id"]
     assert payload["non_content"]["status"] == "staged"
     assert [result["status"] for result in payload["non_content"]["results"]] == [
         "staged", "staged",
@@ -774,7 +820,7 @@ def test_write_approval_rejects_before_pending_persistence(
     assert payload["pending_after_apply"] == []
     assert payload["marker_rows"] == 0
     assert payload["allowed_rows"] == 1
-    assert payload["working_rows"] == 2
+    assert payload["working_rows"] == 4
     assert marker not in json.dumps(payload)
 
 
@@ -970,21 +1016,92 @@ def test_fact_enrichment_reuses_one_policy_snapshot(tmp_path: Path, monkeypatch)
     try:
         memory_id = memory.remember(
             "Allowed note about Alice",
+            source="document",
             extract=True,
             extract_entities=True,
         )
         assert memory_id is not None
-        # One facade resolution plus the pre-existing temporal-annotation path;
-        # fact annotation/table admission must not resolve a third snapshot.
-        assert resolutions == 2
+        assert resolutions == 1
         assert memory.beam.annotations.query_by_memory(memory_id, kind="fact") == []
         mentions = memory.beam.annotations.query_by_memory(memory_id, kind="mentions")
         assert "Alice" in [row["value"] for row in mentions]
+        assert len(memory.beam.annotations.query_by_memory(
+            memory_id, kind="occurred_on"
+        )) == 1
+        assert [row["value"] for row in memory.beam.annotations.query_by_memory(
+            memory_id, kind="has_source"
+        )] == ["document"]
         assert memory.conn.execute(
             "SELECT COUNT(*) FROM facts WHERE object LIKE 'ISSUE821%'"
         ).fetchone()[0] == 0
     finally:
         memory.conn.close()
+
+
+def test_system_derived_temporal_annotations_preserve_exemption(
+    tmp_path: Path, monkeypatch
+):
+    from mnemosyne.core import filters
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import (
+        _SYSTEM_DERIVED_WRITE_CAPABILITY,
+        WritePolicySnapshot,
+    )
+
+    strict = WritePolicySnapshot((r".*",), "strict")
+    monkeypatch.setattr(
+        filters,
+        "resolve_write_policy",
+        lambda: pytest.fail("derived remember must not resolve another policy"),
+    )
+    beam = BeamMemory(session_id="derived-annotations", db_path=tmp_path / "derived.db")
+    try:
+        memory_id = beam.remember(
+            "derived content",
+            source="derived-source",
+            _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+            _write_policy=strict,
+        )
+        assert memory_id is not None
+        assert len(beam.annotations.query_by_memory(memory_id, kind="occurred_on")) == 1
+        assert [row["value"] for row in beam.annotations.query_by_memory(
+            memory_id, kind="has_source"
+        )] == ["derived-source"]
+    finally:
+        beam.conn.close()
+
+
+def test_fact_ids_keep_original_extraction_position(tmp_path: Path):
+    from mnemosyne.core.beam import BeamMemory, _store_facts_in_table
+    from mnemosyne.core.filters import WritePolicySnapshot
+
+    beam = BeamMemory(session_id="stable-facts", db_path=tmp_path / "facts.db")
+    facts = ["ISSUE821 rejected earlier fact", "allowed later fact"]
+    try:
+        memory_id = beam.remember("allowed source memory")
+        _store_facts_in_table(
+            beam, memory_id, "allowed source memory", "test", facts,
+            write_policy=WritePolicySnapshot((r"^ISSUE821",), "strict"),
+        )
+        first_rows = beam.conn.execute(
+            "SELECT fact_id, object FROM facts WHERE source_msg_id = ? ORDER BY object",
+            (memory_id,),
+        ).fetchall()
+        assert len(first_rows) == 1
+        later_id = first_rows[0]["fact_id"]
+
+        _store_facts_in_table(
+            beam, memory_id, "allowed source memory", "test", facts,
+            write_policy=WritePolicySnapshot((), "off"),
+        )
+        rows = beam.conn.execute(
+            "SELECT fact_id, object FROM facts WHERE source_msg_id = ? ORDER BY object",
+            (memory_id,),
+        ).fetchall()
+        assert len(rows) == 2
+        assert {row["object"]: row["fact_id"] for row in rows}["allowed later fact"] == later_id
+    finally:
+        beam.conn.close()
 
 
 def test_media_moments_are_admitted_before_store_and_bind(tmp_path: Path, monkeypatch):
@@ -1032,6 +1149,45 @@ def test_media_moments_are_admitted_before_store_and_bind(tmp_path: Path, monkey
             "SELECT COUNT(*) FROM working_memory WHERE content LIKE 'ISSUE821%'"
         ).fetchone()[0] == 0
         assert any("write policy" in warning for warning in result.warnings)
+    finally:
+        beam.conn.close()
+
+
+def test_system_derived_media_moments_preserve_exemption(tmp_path: Path, monkeypatch):
+    from mnemosyne.core import media
+    from mnemosyne.core.beam import BeamMemory
+    from mnemosyne.core.filters import (
+        _SYSTEM_DERIVED_WRITE_CAPABILITY,
+        WritePolicySnapshot,
+    )
+    from mnemosyne.core.modality_backends import DescribedMoment, DescribeResult
+
+    strict = WritePolicySnapshot((r"^ISSUE821",), "strict")
+    monkeypatch.setattr(
+        media,
+        "_describe",
+        lambda *_args, **_kwargs: DescribeResult(
+            provider="stub",
+            moments=[
+                DescribedMoment(kind="caption", text="ISSUE821 exempt caption"),
+                DescribedMoment(kind="ocr", text="allowed exempt OCR"),
+            ],
+        ),
+    )
+    beam = BeamMemory(session_id="derived-media", db_path=tmp_path / "derived-media.db")
+    try:
+        result = beam.remember_media(
+            "https://example.test/allowed-derived.png",
+            _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
+            _write_policy=strict,
+        )
+        assert result.status == "ok"
+        moments = beam.media.get_moments(result.asset_id)
+        assert [row["text"] for row in moments] == [
+            "ISSUE821 exempt caption", "allowed exempt OCR",
+        ]
+        assert [row["memory_id"] for row in moments] == result.memory_ids
+        assert len(result.moment_ids) == len(result.memory_ids) == 2
     finally:
         beam.conn.close()
 

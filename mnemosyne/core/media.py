@@ -1437,7 +1437,9 @@ def remember_media(
         admitted_drafts = [
             draft
             for draft in drafts
-            if admit_memory_write(draft.text, policy=write_policy)[0]
+            if admit_memory_write(
+                draft.text, write_kind=_write_kind, policy=write_policy
+            )[0]
         ]
         filtered = len(drafts) - len(admitted_drafts)
         if filtered:

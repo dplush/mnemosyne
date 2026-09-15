@@ -255,7 +255,7 @@ memory:
   mnemosyne:
     auto_sleep: true
     sleep_threshold: 30
-    write_classifier: off  # off | warn | strict
+    write_classifier: "off"  # off | warn | strict
 ```
 
 `write_classifier` controls admission for explicit writes and autosaved turns.

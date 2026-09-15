@@ -133,9 +133,6 @@ class BaseImporter(ABC):
                         f"Failed to import '{mem_dict.get('content', '')[:80]}': {e}"
                     )
 
-            if result.skipped:
-                result.skipped = result.total - result.imported - result.failed
-
         except Exception as e:
             result.errors.append(f"Import failed: {e}")
 
