@@ -660,6 +660,21 @@ pending_files = list(pending_root.rglob("*")) if pending_root.exists() else []
 pending_text = "\n".join(
     path.read_text(errors="replace") for path in pending_files if path.is_file()
 )
+approved_update_batch = json.loads(provider.handle_tool_call(
+    "mnemosyne_batch", {"operations": [{
+        "action": "update", "memory_id": allowed_id,
+        "content": "allowed approved update", "importance": 0.83,
+    }]}
+))
+approved_update_pending = approved_update_batch["results"][0]["pending_id"]
+unsupported_pending = module._stage_pending_write({
+    "tool": "mnemosyne_batch", "action": "unsupported",
+    "content": "allowed but unsupported",
+})
+approved_update_apply = json.loads(provider.handle_tool_call(
+    "mnemosyne_apply_pending",
+    {"pending_ids": [approved_update_pending, unsupported_pending]},
+))
 non_content = json.loads(provider.handle_tool_call("mnemosyne_batch", {"operations": [
     {"action": "update", "memory_id": allowed_id, "importance": 0.9},
     {"action": "forget", "memory_id": allowed_id},
@@ -687,6 +702,10 @@ print(json.dumps({
     "non_content": non_content,
     "non_content_records": non_content_records,
     "apply_response": json.loads(apply_response),
+    "approved_update_batch": approved_update_batch,
+    "approved_update_apply": approved_update_apply,
+    "unsupported_pending": unsupported_pending,
+    "allowed_id": allowed_id,
     "pending_after_apply": [str(path) for path in pending_root.rglob("*.json")],
     "marker_rows": provider._beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%ISSUE821%'"
@@ -694,8 +713,12 @@ print(json.dumps({
     "allowed_rows": provider._beam.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE content = 'allowed pending content'"
     ).fetchone()[0],
+    "working_rows": provider._beam.conn.execute(
+        "SELECT COUNT(*) FROM working_memory"
+    ).fetchone()[0],
     "logs": capture.messages,
     "original": provider._beam.get(allowed_id)["content"],
+    "updated_importance": provider._beam.get(allowed_id)["importance"],
 }))
 """
 
@@ -724,7 +747,19 @@ def test_write_approval_rejects_before_pending_persistence(
         {"index": 1, "action": "update", "status": "filtered"},
     ]
     assert payload["pending_entries"] == []
-    assert payload["original"] == "allowed original"
+    assert payload["original"] == "allowed approved update"
+    assert payload["updated_importance"] == pytest.approx(0.83)
+    assert payload["approved_update_batch"]["results"][0]["status"] == "staged"
+    assert payload["approved_update_apply"] == {
+        "applied": [{
+            "id": payload["approved_update_batch"]["results"][0]["pending_id"],
+            "memory_id": payload["allowed_id"],
+        }],
+        "failed": [{"id": payload["unsupported_pending"],
+                    "error": "unsupported action"}],
+        "applied_count": 1,
+        "failed_count": 1,
+    }
     assert payload["non_content"]["status"] == "staged"
     assert [result["status"] for result in payload["non_content"]["results"]] == [
         "staged", "staged",
@@ -739,6 +774,7 @@ def test_write_approval_rejects_before_pending_persistence(
     assert payload["pending_after_apply"] == []
     assert payload["marker_rows"] == 0
     assert payload["allowed_rows"] == 1
+    assert payload["working_rows"] == 2
     assert marker not in json.dumps(payload)
 
 
@@ -1096,27 +1132,35 @@ def test_batch_fact_enrichment_reuses_batch_policy_snapshot(
         resolutions += 1
         return strict if resolutions == 1 else permissive
 
-    real_extract = beam_module._extract_and_store_facts
-
-    def capture_fact_policy(*args, **kwargs):
-        fact_policies.append(kwargs.get("write_policy"))
-        return real_extract(*args, **kwargs)
-
     monkeypatch.setattr(filters, "resolve_write_policy", changing_policy)
-    monkeypatch.setattr(beam_module, "_extract_and_store_facts", capture_fact_policy)
     monkeypatch.setattr(
         extraction,
         "extract_facts_safe",
         lambda _content: ["ISSUE821 generated batch fact must not persist"],
     )
     beam = BeamMemory(session_id="batch-fact-snapshot", db_path=tmp_path / "batch.db")
+    real_annotation_add_many = beam.annotations.add_many
+    real_table_store = beam_module._store_facts_in_table
+
+    def capture_annotation_policy(*args, **kwargs):
+        result = real_annotation_add_many(*args, **kwargs)
+        fact_policies.append(("annotations", kwargs.get("_write_policy")))
+        return result
+
+    def capture_table_policy(*args, **kwargs):
+        result = real_table_store(*args, **kwargs)
+        fact_policies.append(("facts", kwargs.get("write_policy")))
+        return result
+
+    monkeypatch.setattr(beam.annotations, "add_many", capture_annotation_policy)
+    monkeypatch.setattr(beam_module, "_store_facts_in_table", capture_table_policy)
     try:
         memory_ids = beam.remember_batch(
             [{"content": "Allowed batch note", "source": "test"}],
             extract=True,
         )
         assert len(memory_ids) == 1
-        assert fact_policies == [strict]
+        assert fact_policies == [("annotations", strict), ("facts", strict)]
         assert beam.annotations.query_by_memory(memory_ids[0], kind="fact") == []
         assert beam.conn.execute(
             "SELECT COUNT(*) FROM facts WHERE object LIKE 'ISSUE821%'"
@@ -1125,8 +1169,12 @@ def test_batch_fact_enrichment_reuses_batch_policy_snapshot(
         beam.conn.close()
 
 
-def test_mcp_annotation_triple_add_reuses_operation_policy_snapshot(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    ("predicate", "expected_store", "id_key"),
+    [("mentions", "annotations", "annotation_id"), ("prefers", "triples", "triple_id")],
+)
+def test_mcp_triple_add_reuses_operation_policy_snapshot(
+    tmp_path: Path, monkeypatch, predicate: str, expected_store: str, id_key: str
 ):
     from mnemosyne import mcp_tools
     from mnemosyne.core import filters
@@ -1148,16 +1196,28 @@ def test_mcp_annotation_triple_add_reuses_operation_policy_snapshot(
     try:
         result = mcp_tools._handle_triple_add({
             "subject": "memory-1",
-            "predicate": "mentions",
+            "predicate": predicate,
             "object": "ISSUE821 admitted by the operation snapshot",
         })
         assert result["status"] == "added"
-        assert result["store"] == "annotations"
-        assert isinstance(result["annotation_id"], int)
+        assert result["store"] == expected_store
+        assert result[id_key]
         assert resolutions == 1
-        rows = memory.beam.annotations.query_by_memory("memory-1", kind="mentions")
-        assert [row["value"] for row in rows] == [
-            "ISSUE821 admitted by the operation snapshot"
-        ]
+        if expected_store == "annotations":
+            rows = memory.beam.annotations.query_by_memory("memory-1", kind="mentions")
+            assert [row["value"] for row in rows] == [
+                "ISSUE821 admitted by the operation snapshot"
+            ]
+        else:
+            from mnemosyne.core.triples import TripleStore
+
+            triples = TripleStore(db_path=memory.beam.db_path)
+            try:
+                rows = triples.query(subject="memory-1", predicate="prefers")
+                assert [row["object"] for row in rows] == [
+                    "ISSUE821 admitted by the operation snapshot"
+                ]
+            finally:
+                triples.conn.close()
     finally:
         memory.conn.close()

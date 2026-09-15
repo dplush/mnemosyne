@@ -255,7 +255,14 @@ memory:
   mnemosyne:
     auto_sleep: true
     sleep_threshold: 30
+    write_classifier: off  # off | warn | strict
 ```
+
+`write_classifier` controls admission for explicit writes and autosaved turns.
+`off` applies only `ignore_patterns`; `warn` runs the noise/secret classifier but
+still stores classified content; `strict` rejects content classified as noise or
+secret-like. An `initialize(..., write_classifier=...)` kwarg takes precedence
+over `memory.mnemosyne.write_classifier` in Hermes configuration.
 
 ## Tools
 

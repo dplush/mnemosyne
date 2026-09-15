@@ -254,6 +254,9 @@ def test_provider_config_defaults_match(provider_modules):
     assert root_config["sync_roles"]["default"] == ["user"]
     assert root_config["default_scope"]["choices"] == ["session", "global"]
     assert root_config["default_scope"]["default"] == "session"
+    assert root_config["write_classifier"]["choices"] == ["off", "warn", "strict"]
+    assert root_config["write_classifier"]["default"] == "off"
+    assert "kwarg overrides" in root_config["write_classifier"]["description"]
     assert root_config["tools"]["default"] is None
 
 

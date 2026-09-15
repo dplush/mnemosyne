@@ -1300,6 +1300,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             {"key": "reflect", "description": "Reflection/sleep guardrails. Supports disabled_for_cron (default true) and max_calls_per_session (default 3; negative disables cap). Env: MNEMOSYNE_REFLECT_DISABLED_FOR_CRON, MNEMOSYNE_REFLECT_MAX_CALLS_PER_SESSION.", "default": {"disabled_for_cron": True, "max_calls_per_session": 3}},
             {"key": "vector_type", "description": "Vector storage type (note: not yet wired to BeamMemory at runtime; reserved for future use)", "choices": ["float32", "int8", "bit"], "default": "int8"},
             {"key": "ignore_patterns", "description": "Regex patterns to filter from memory storage (one per line in config, or comma-separated). Memories matching any pattern are skipped.", "default": []},
+            {"key": "write_classifier", "description": "Write admission mode. 'off' applies only ignore_patterns; 'warn' runs noise and secret classification but allows classified writes; 'strict' rejects classified writes. An initialize() kwarg overrides memory.mnemosyne.write_classifier in Hermes config.", "choices": ["off", "warn", "strict"], "default": "off"},
             {"key": "profile_isolation", "description": "Enable per-profile memory isolation via Mnemosyne banks. Each Hermes profile gets its own SQLite database under mnemosyne/data/banks/<profile>/. Default false for backward compatibility.", "default": False},
             {"key": "shared_surface_path", "description": "SQLite path for shared surface memories. Default is <mnemosyne>/data/shared/mnemosyne.db.", "default": "data/shared/mnemosyne.db"},
             {"key": "shared_surface_read", "description": "When true, mnemosyne_recall merges shared-surface results into private bank recall, tagging each result with its bank ('private' or 'surface'). Default false.", "default": False},
@@ -3042,25 +3043,63 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     failed.append({"id": pid, "error": "id mismatch"})
                     continue
                 p = record.get("payload", {})
-                c = p.get("content", "")
-                if not c:
-                    failed.append({"id": pid, "error": "empty content"})
-                    rp.unlink(missing_ok=True)
-                    continue
-                mid = self._beam.remember(
-                    content=c,
-                    importance=float(p.get("importance", 0.5)),
-                    source=p.get("source", "user"),
-                    scope=p.get("scope", self._default_scope),
-                    valid_until=p.get("valid_until"),
-                    extract_entities=bool(p.get("extract_entities", False)),
-                    extract=bool(p.get("extract", False)),
-                    metadata=p.get("metadata"),
-                    veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
-                    _write_policy=policy,
-                )
-                if mid is None:
-                    failed.append({"id": pid, "error": "filtered"})
+                action = p.get("action")
+                if action is None and record.get("tool") == "mnemosyne_remember":
+                    action = "remember"
+                if action == "remember":
+                    c = p.get("content", "")
+                    if not c:
+                        failed.append({"id": pid, "error": "empty content"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                    mid = self._beam.remember(
+                        content=c,
+                        importance=float(p.get("importance", 0.5)),
+                        source=p.get("source", "user"),
+                        scope=p.get("scope", self._default_scope),
+                        valid_until=p.get("valid_until"),
+                        extract_entities=bool(p.get("extract_entities", False)),
+                        extract=bool(p.get("extract", False)),
+                        metadata=p.get("metadata"),
+                        veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
+                        _write_policy=policy,
+                    )
+                    if mid is None:
+                        failed.append({"id": pid, "error": "filtered"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                elif action == "update":
+                    mid = str(p.get("memory_id") or "").strip()
+                    if not mid:
+                        failed.append({"id": pid, "error": "memory_id is required"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                    updated = self._beam.update_working(
+                        mid,
+                        content=p.get("content"),
+                        importance=p.get("importance"),
+                        _write_policy=policy,
+                    )
+                    if updated is None:
+                        failed.append({"id": pid, "error": "filtered"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                    if not updated:
+                        failed.append({"id": pid, "error": "memory not found"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                elif action == "forget":
+                    mid = str(p.get("memory_id") or "").strip()
+                    if not mid:
+                        failed.append({"id": pid, "error": "memory_id is required"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                    if not self._beam.forget_working(mid):
+                        failed.append({"id": pid, "error": "memory not found"})
+                        rp.unlink(missing_ok=True)
+                        continue
+                else:
+                    failed.append({"id": pid, "error": "unsupported action"})
                     rp.unlink(missing_ok=True)
                     continue
                 rp.unlink(missing_ok=True)
