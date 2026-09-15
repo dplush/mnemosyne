@@ -1934,6 +1934,12 @@ class _BeamConnection(sqlite3.Connection):
         self._defer_commit = False
         self._savepoint_counter = 0
         self._vec_working_count_cache: Optional[Tuple[int, int, int]] = None
+        # After-commit hooks (see #963): callables fired once, after the
+        # next real commit, then discarded. A rollback discards them
+        # unseen. Lets callers defer side effects (e.g. event emission)
+        # until data is actually durable instead of firing on savepoint
+        # release inside a caller-owned transaction.
+        self._after_commit_hooks: List[Callable[[], None]] = []
 
     def _next_savepoint_name(self, purpose: str) -> str:
         """Return a connection-local, SQLite-safe savepoint identifier."""
@@ -1944,11 +1950,36 @@ class _BeamConnection(sqlite3.Connection):
         if self._defer_commit:
             return
         super().commit()
+        self._drain_after_commit_hooks()
+
+    def rollback(self) -> None:
+        # Pending hooks describe uncommitted state: a rollback must never
+        # let them fire later, so discard before delegating. Clearing first
+        # is deliberate — if the rollback itself fails the connection is
+        # untrustworthy and queued side effects must not survive it.
+        self._after_commit_hooks.clear()
+        super().rollback()
+
+    def _drain_after_commit_hooks(self) -> None:
+        """Fire queued after-commit hooks once each; never raises.
+
+        A failing hook is logged and skipped so one bad side effect
+        cannot break the commit path or starve later hooks. The queue is
+        drained before running so a hook registering another hook defers
+        it to the *next* commit instead of recursing.
+        """
+        hooks, self._after_commit_hooks = self._after_commit_hooks, []
+        for hook in hooks:
+            try:
+                hook()
+            except Exception:
+                logger.exception("after-commit hook failed; skipping")
 
     def _real_commit(self) -> None:
         """Force a real commit regardless of the defer flag.
         Used by `_deferred_commits` on successful exit."""
         super().commit()
+        self._drain_after_commit_hooks()
 
 
 @contextlib.contextmanager
