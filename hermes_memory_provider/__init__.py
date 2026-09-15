@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1385,6 +1386,29 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     _SYNC_TURN_SLOW_THRESHOLD_SECONDS = _parse_env_float("MNEMOSYNE_SYNC_TURN_SLOW_THRESHOLD", 5)
 
     _VALID_SYNC_ROLES: frozenset = frozenset({"user", "assistant"})
+    _WRITE_POLICY_TOOL_NAMES: frozenset = frozenset({
+        "mnemosyne_apply_pending",
+        "mnemosyne_batch",
+        "mnemosyne_forget",
+        "mnemosyne_forget_canonical",
+        "mnemosyne_graph_link",
+        "mnemosyne_import",
+        "mnemosyne_invalidate",
+        "mnemosyne_model_refresh",
+        "mnemosyne_remember",
+        "mnemosyne_remember_canonical",
+        "mnemosyne_scratchpad_clear",
+        "mnemosyne_scratchpad_write",
+        "mnemosyne_shared_forget",
+        "mnemosyne_shared_remember",
+        "mnemosyne_sleep",
+        "mnemosyne_sync_pull",
+        "mnemosyne_task_progress",
+        "mnemosyne_triple_add",
+        "mnemosyne_triple_end",
+        "mnemosyne_update",
+        "mnemosyne_validate",
+    })
 
     def __init__(self):
         # Keep the wrapper alive whenever the provider adopts its BeamMemory.
@@ -1458,6 +1482,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._reflect_calls_this_session = 0
         self._reflect_budget_lock = threading.Lock()
         self._ignore_patterns: List[str] = []  # Regex patterns to filter from memory
+        # Explicit initialize() policy kwargs remain sticky across runtime
+        # config reloads and provider re-initialization. Empty values are real
+        # overrides, so membership (not truthiness) controls precedence.
+        self._write_policy_overrides: Dict[str, Any] = {}
         self._sync_roles: Set[str] = {"user"}
         _sync_env = os.environ.get("MNEMOSYNE_SYNC_ROLES")
         if _sync_env is not None:
@@ -1658,31 +1686,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if vector_type and vector_type not in ("float32", "int8", "bit"):
             logger.warning("Mnemosyne: unknown vector_type=%r, ignoring", vector_type)
 
-        # Capture the provider's effective policy without bridging through
-        # os.environ. Explicit kwargs and Hermes config keep their precedence.
-        from mnemosyne.core.filters import make_write_policy, resolve_write_policy
-        core_policy = resolve_write_policy()
-        patterns = kwargs.get("ignore_patterns")
-        if patterns is None:
-            patterns = read_hermes_config_key(
-                getattr(self, "_hermes_home", None), "ignore_patterns"
-            )
-        if patterns is None:
-            patterns = core_policy.ignore_patterns
-        if isinstance(patterns, str):
-            patterns = [p.strip() for p in patterns.replace(",", "\n").split("\n") if p.strip()]
-        elif isinstance(patterns, (list, tuple)):
-            patterns = [str(p).strip() for p in patterns if str(p).strip()]
-        self._ignore_patterns = patterns
-
-        configured_mode = kwargs.get("write_classifier")
-        if configured_mode is None:
-            configured_mode = read_hermes_config_key(
-                getattr(self, "_hermes_home", None), "write_classifier"
-            )
-        if configured_mode is None:
-            configured_mode = core_policy.classifier_mode
-        self._write_policy = make_write_policy(self._ignore_patterns, configured_mode)
+        overrides = getattr(self, "_write_policy_overrides", None)
+        if overrides is None:
+            overrides = self._write_policy_overrides = {}
+        for key in ("ignore_patterns", "write_classifier"):
+            if key in kwargs and kwargs[key] is not None:
+                overrides[key] = kwargs[key]
+        self._write_policy = self._resolve_effective_write_policy()
 
         # profile_isolation: separate DB per Hermes profile (bank-based).
         # Default OFF. When enabled, each profile derives its own Mnemosyne bank.
@@ -1773,6 +1783,51 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             except re.error:
                 logger.debug("Mnemosyne: invalid ignore pattern %r, skipping", pattern)
         return False
+
+    def _resolve_effective_write_policy(self):
+        """Resolve one immutable provider policy for a public write operation."""
+        from mnemosyne.core.filters import make_write_policy, resolve_write_policy
+
+        core_policy = resolve_write_policy()
+        overrides = getattr(self, "_write_policy_overrides", {})
+        patterns = overrides.get("ignore_patterns")
+        if "ignore_patterns" not in overrides:
+            patterns = read_hermes_config_key(
+                getattr(self, "_hermes_home", None), "ignore_patterns"
+            )
+        if patterns is None:
+            patterns = core_policy.ignore_patterns
+        if isinstance(patterns, str):
+            patterns = [
+                pattern.strip()
+                for pattern in patterns.replace(",", "\n").split("\n")
+                if pattern.strip()
+            ]
+        elif isinstance(patterns, (list, tuple)):
+            patterns = [str(pattern).strip() for pattern in patterns if str(pattern).strip()]
+
+        configured_mode = overrides.get("write_classifier")
+        if "write_classifier" not in overrides:
+            configured_mode = read_hermes_config_key(
+                getattr(self, "_hermes_home", None), "write_classifier"
+            )
+        if configured_mode is None:
+            configured_mode = core_policy.classifier_mode
+
+        policy = make_write_policy(patterns, configured_mode)
+        self._ignore_patterns = list(policy.ignore_patterns)
+        self._write_policy = policy
+        return policy
+
+    def _current_operation_write_policy(self):
+        """Return the immutable snapshot bound to the current operation."""
+        from mnemosyne.core.filters import _active_write_policy, current_write_policy
+
+        return (
+            _active_write_policy.get()
+            or getattr(self, "_write_policy", None)
+            or current_write_policy()
+        )
 
     def _read_config_key(self, key: str) -> Any:
         """Read a single key, checking Hermes config first, then Mnemosyne config.
@@ -2460,8 +2515,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         try:
             from mnemosyne.core.filters import write_policy_operation
+            policy = self._resolve_effective_write_policy()
             with write_policy_operation(
-                getattr(self, "_write_policy", None)
+                policy
             ), self._ensure_beam_access_lock():
                 ledger_session_id = str(session_id or "").strip()
                 if ledger_session_id and not getattr(self, "_active_session_id", ""):
@@ -2600,7 +2656,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     scope="global",
                     veracity="stated",
                     _write_kind=_SYSTEM_DERIVED_WRITE_CAPABILITY,
-                    _write_policy=getattr(self, "_write_policy", None),
+                    _write_policy=self._current_operation_write_policy(),
                 )
                 break  # One identity memory per turn
 
@@ -2659,7 +2715,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         from mnemosyne.core.filters import write_policy_operation
 
-        with write_policy_operation(getattr(self, "_write_policy", None)):
+        policy_context = (
+            write_policy_operation(self._resolve_effective_write_policy())
+            if tool_name in self._WRITE_POLICY_TOOL_NAMES
+            else nullcontext()
+        )
+        with policy_context:
             return self._dispatch_tool_call(tool_name, args, **kwargs)
 
     def _dispatch_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -2835,7 +2896,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _write_approval_enabled():
             from mnemosyne.core.filters import admit_memory_write
 
-            policy = getattr(self, "_write_policy", None)
+            policy = self._current_operation_write_policy()
             if not admit_memory_write(content, policy=policy)[0]:
                 return json.dumps({"status": "filtered"})
             pid = _stage_pending_write({
@@ -2867,7 +2928,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             extract=extract,
             metadata=metadata,
             veracity=veracity,
-            _write_policy=getattr(self, "_write_policy", None),
+            _write_policy=self._current_operation_write_policy(),
         )
         if memory_id is None:
             return json.dumps({"status": "filtered"})
@@ -2898,7 +2959,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if _write_approval_enabled():
             from mnemosyne.core.filters import admit_memory_write
 
-            policy = getattr(self, "_write_policy", None)
+            policy = self._current_operation_write_policy()
             staged = []
             results = []
             for op in normalized:
@@ -2941,7 +3002,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             remember_source_tool="mnemosyne_batch",
             audit_event=self._audit_event,
             extract_defaults_global=False,
-            write_policy=getattr(self, "_write_policy", None),
+            write_policy=self._current_operation_write_policy(),
         ))
 
     def _handle_recall(self, args: Dict[str, Any]) -> str:
@@ -3090,7 +3151,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             scope="global",
             memory_id=stable_id,
             veracity=veracity,
-            _write_policy=getattr(self, "_write_policy", None),
+            _write_policy=self._current_operation_write_policy(),
             _write_policy_content=content,
         )
         if memory_id is None:
@@ -3219,7 +3280,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             from mnemosyne.core.filters import admit_memory_write
 
             if not admit_memory_write(
-                new_content, policy=getattr(self, "_write_policy", None)
+                new_content, policy=self._current_operation_write_policy()
             )[0]:
                 return json.dumps({
                     "status": "filtered",
@@ -3401,7 +3462,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return json.dumps({"error": "subject, predicate, and object are required"})
         from mnemosyne.core.filters import admit_memory_write
         if not admit_memory_write(
-            obj, policy=getattr(self, "_write_policy", None)
+            obj, policy=self._current_operation_write_policy()
         )[0]:
             return json.dumps({"status": "filtered"})
         valid_until = args.get("valid_until", None) or None
@@ -3560,7 +3621,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         from hermes_constants import get_hermes_home
         from mnemosyne.core.veracity_consolidation import clamp_veracity
 
-        policy = getattr(self, "_write_policy", None)
+        policy = self._current_operation_write_policy()
 
         pending_ids = args.get("pending_ids") or []
         if isinstance(pending_ids, str):
@@ -3855,7 +3916,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             memory_id,
             content=content,
             importance=importance,
-            _write_policy=getattr(self, "_write_policy", None),
+            _write_policy=self._current_operation_write_policy(),
         )
         if ok is None:
             return json.dumps({"status": "filtered", "memory_id": memory_id})
@@ -4106,9 +4167,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return
         try:
             from mnemosyne.core.filters import write_policy_operation
+            policy = self._resolve_effective_write_policy()
 
             with write_policy_operation(
-                getattr(self, "_write_policy", None)
+                policy
             ), self._ensure_beam_access_lock():
                 scope = "global" if target == "user" else "session"
                 self._beam.remember(
@@ -4116,7 +4178,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     source=f"builtin_memory_{target}",
                     importance=0.7 if target == "user" else 0.5,
                     scope=scope,
-                    _write_policy=getattr(self, "_write_policy", None),
+                    _write_policy=self._current_operation_write_policy(),
                 )
         except Exception as e:
             logger.debug("Mnemosyne mirror write failed: %s", type(e).__name__)

@@ -975,6 +975,12 @@ def test_lazy_tool_initialization_precedes_policy_snapshot():
     provider._maybe_retry_init = initialize_policy
     provider._ensure_initialized_for_tools = lambda: calls.append("ensure")
 
+    def resolve_policy():
+        calls.append("resolve")
+        return provider._write_policy
+
+    provider._resolve_effective_write_policy = resolve_policy
+
     @contextmanager
     def beam_scope(_session_id):
         yield object()
@@ -990,7 +996,151 @@ def test_lazy_tool_initialization_precedes_policy_snapshot():
     result = json.loads(provider.handle_tool_call("mnemosyne_remember", {}))
 
     assert result == {"mode": "strict"}
-    assert calls == ["retry", "ensure", "dispatch"]
+    assert calls == ["retry", "ensure", "resolve", "dispatch"]
+
+
+@pytest.mark.parametrize(
+    "provider_module", ["hermes_memory_provider", "mnemosyne_hermes"]
+)
+def test_provider_write_policy_reloads_between_sync_operations(
+    tmp_path: Path, monkeypatch, provider_module: str
+):
+    import importlib
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    hermes_home = tmp_path / provider_module
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "memory:\n"
+        "  mnemosyne:\n"
+        "    ignore_patterns: ['^REFRESH821']\n"
+        "    write_classifier: strict\n"
+        "    sync_roles: [user, assistant]\n"
+    )
+    module = importlib.import_module(provider_module)
+    provider = module.MnemosyneMemoryProvider()
+    provider.initialize(
+        "policy-refresh",
+        hermes_home=str(hermes_home),
+        auto_sleep=False,
+    )
+    assert provider._beam is not None
+
+    real_remember = provider._beam.remember
+    calls = 0
+
+    def remember_while_config_changes(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            config_path.write_text(
+                "memory:\n"
+                "  mnemosyne:\n"
+                "    ignore_patterns: []\n"
+                "    write_classifier: off\n"
+                "    sync_roles: [user, assistant]\n"
+            )
+        return real_remember(*args, **kwargs)
+
+    provider._beam.remember = remember_while_config_changes
+    try:
+        provider.sync_turn(
+            "REFRESH821 first user content",
+            "REFRESH821 first assistant content",
+            session_id="policy-refresh",
+        )
+        assert calls == 2
+        assert provider._beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%REFRESH821%'"
+        ).fetchone()[0] == 0
+
+        response = json.loads(provider.handle_tool_call(
+            "mnemosyne_batch",
+            {"operations": [
+                {"action": "remember", "content": "REFRESH821 second user content"},
+                {
+                    "action": "remember",
+                    "content": "REFRESH821 second assistant content",
+                },
+            ]},
+        ))
+        assert [item["status"] for item in response["results"]] == [
+            "stored",
+            "stored",
+        ]
+        assert calls == 4
+        rows = provider._beam.conn.execute(
+            "SELECT content FROM working_memory WHERE content LIKE '%REFRESH821%' "
+            "ORDER BY rowid"
+        ).fetchall()
+        assert [row[0] for row in rows] == [
+            "REFRESH821 second user content",
+            "REFRESH821 second assistant content",
+        ]
+        assert provider._write_policy.classifier_mode == "off"
+        assert provider._write_policy.ignore_patterns == ()
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    "provider_module", ["hermes_memory_provider", "mnemosyne_hermes"]
+)
+def test_provider_initialize_policy_overrides_remain_sticky(
+    tmp_path: Path, monkeypatch, provider_module: str
+):
+    import importlib
+
+    monkeypatch.setenv("MNEMOSYNE_NO_EMBEDDINGS", "1")
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    hermes_home = tmp_path / provider_module
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n"
+        "  mnemosyne:\n"
+        "    ignore_patterns: []\n"
+        "    write_classifier: off\n"
+        "    sync_roles: [user, assistant]\n"
+    )
+    module = importlib.import_module(provider_module)
+    provider = module.MnemosyneMemoryProvider()
+    provider.initialize(
+        "sticky-policy",
+        hermes_home=str(hermes_home),
+        auto_sleep=False,
+        ignore_patterns=[r"^STICKY821"],
+        write_classifier="strict",
+    )
+    assert provider._beam is not None
+    try:
+        # Re-initializing without policy kwargs must retain explicit overrides.
+        provider.initialize(
+            "sticky-policy",
+            hermes_home=str(hermes_home),
+            auto_sleep=False,
+        )
+        provider.sync_turn(
+            "STICKY821 user content",
+            "STICKY821 assistant content",
+            session_id="sticky-policy",
+        )
+        assert provider._beam.conn.execute(
+            "SELECT COUNT(*) FROM working_memory WHERE content LIKE '%STICKY821%'"
+        ).fetchone()[0] == 0
+        assert provider._write_policy.classifier_mode == "strict"
+        assert provider._write_policy.ignore_patterns == (r"^STICKY821",)
+        provider._resolve_effective_write_policy = lambda: pytest.fail(
+            "read-only tools must not refresh write policy"
+        )
+        assert "error" not in json.loads(
+            provider.handle_tool_call("mnemosyne_stats", {})
+        )
+    finally:
+        provider.shutdown()
 
 
 def test_fact_enrichment_reuses_one_policy_snapshot(tmp_path: Path, monkeypatch):
