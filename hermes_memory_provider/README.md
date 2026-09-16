@@ -34,14 +34,20 @@ memory:
     auto_sleep: true
     sleep_threshold: 50
     vector_type: float32  # float32 | int8 | bit
+    ignore_patterns:
+      - "^\\s*\\$\\s*pip\\s"
     write_classifier: "off"  # off | warn | strict
 ```
 
-`write_classifier` controls admission for explicit writes and autosaved turns.
-`off` applies only `ignore_patterns`; `warn` runs the noise/secret classifier but
-still stores classified content; `strict` rejects content classified as noise or
-secret-like. An `initialize(..., write_classifier=...)` kwarg takes precedence
-over `memory.mnemosyne.write_classifier` in Hermes configuration.
+The corresponding environment variables are `MNEMOSYNE_IGNORE_PATTERNS`
+(newline-separated regular expressions, empty by default) and
+`MNEMOSYNE_WRITE_CLASSIFIER` (`off` by default). For these settings, an explicit
+`initialize(...)` keyword argument takes precedence. Without that override,
+resolution is `memory.mnemosyne` in `config.yaml` > environment variable >
+default. `off` still applies `ignore_patterns`; `warn` runs the noise/secret
+classifier but stores classified content with warnings; and `strict` rejects
+content classified as noise or secret-like. Unset, blank, or invalid classifier
+values fall back to `off` (invalid values also log a warning).
 
 ## Verify
 

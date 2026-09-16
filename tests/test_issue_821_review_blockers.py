@@ -831,8 +831,8 @@ def test_write_approval_rejects_before_pending_persistence(
         "staged", "staged",
     ]
     assert [record["memory_id"] for record in payload["non_content_records"]] == [
-        payload["non_content_records"][0]["memory_id"],
-        payload["non_content_records"][0]["memory_id"],
+        payload["allowed_id"],
+        payload["allowed_id"],
     ]
     assert payload["apply_response"]["applied_count"] == 1
     assert payload["apply_response"]["failed_count"] == 1
