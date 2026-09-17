@@ -440,6 +440,55 @@ def test_same_session_replay_is_not_reported_as_redirected(
 
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
+def test_channel_binding_is_restored_when_it_differs_under_one_session(
+    provider_module_name, monkeypatch, tmp_path
+):
+    """The channel is its own axis: it is restored even without a session switch.
+
+    A record staged while the Beam carried an explicit channel_id must replay
+    under THAT channel (a channel-only difference is corrected silently; the
+    session-redirect fields stay clear because no redirect happened).
+    """
+    module = _import_provider(provider_module_name)
+    _force_approval_gate(module, monkeypatch)
+    with _pending_home(monkeypatch, tmp_path) as pending_dir:
+        with _provider(module, tmp_path, "sess-a") as prov:
+            # Re-bind the live beam to a distinct channel, then stage.
+            prov._beam.channel_id = "channel-one"
+            pids = _stage_ops_in_session_a(prov, [
+                {"action": "remember", "content": "channel bound", "scope": "session"},
+            ])
+            record = _record(pending_dir, pids[0])
+            assert record["channel_scope"] == "channel-one"
+
+            # Same session, different channel at approval time.
+            prov._beam.channel_id = "channel-two"
+            applied = json.loads(prov.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": pids}
+            ))
+            assert applied["applied_count"] == 1, applied
+            assert applied["failed_count"] == 0, applied
+            # No session redirect happened, so none is reported.
+            assert applied["session_redirected_count"] == 0
+            assert "session_replayed_into" not in applied["applied"][0]
+
+            conn = sqlite3.connect(str(_db_path(prov)))
+            try:
+                row = conn.execute(
+                    "SELECT session_id, channel_id FROM working_memory WHERE content = ?",
+                    ("channel bound",),
+                ).fetchone()
+            finally:
+                conn.close()
+            assert row is not None
+            assert row[0] == "hermes_sess-a"
+            # The staged channel is restored instead of the approval-time one.
+            assert row[1] == "channel-one", row
+            # The live beam keeps its own channel afterwards.
+            assert prov._beam.channel_id == "channel-two"
+
+
+@pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
 def test_legacy_record_without_recorded_scope_replays_through_active_beam(
     provider_module_name, monkeypatch, tmp_path
 ):

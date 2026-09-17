@@ -3218,11 +3218,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 recorded_scope = str(record.get("session_scope") or "").strip()
                 recorded_channel = str(record.get("channel_scope") or "").strip()
                 current_scope = str(getattr(self, "_session_id", "") or "").strip()
+                current_channel = str(getattr(self._beam, "channel_id", "") or "").strip()
                 session_redirected = bool(
                     recorded_scope and current_scope and recorded_scope != current_scope
                 )
-                replay_scope = recorded_scope if session_redirected else ""
-                replay_channel = recorded_channel if session_redirected else ""
+                # The channel is its own axis (an explicit channel_id survives a
+                # session switch), so the recorded binding is restored when
+                # EITHER half differs -- not only when the session does. The
+                # session redirect is what gets *reported*; a channel-only
+                # difference is a silent correction of the write's attribution.
+                needs_rebind = bool(recorded_scope) and (
+                    session_redirected
+                    or (bool(recorded_channel) and recorded_channel != current_channel)
+                )
+                replay_scope = recorded_scope if needs_rebind else ""
+                replay_channel = recorded_channel if needs_rebind else ""
 
                 # PR #926 finding 4: dispatch each approved record by the
                 # action captured at stage time, mirroring apply_beam_batch/
