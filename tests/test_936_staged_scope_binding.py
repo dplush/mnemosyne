@@ -31,6 +31,42 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 STAGED_CONTENT = "belongs to session A"
 
+# Provider packages whose module identities _import_provider() swaps.
+PROVIDER_MODULES = ("hermes_memory_provider", "mnemosyne_hermes")
+
+
+@pytest.fixture(autouse=True)
+def _restore_provider_modules():
+    """Restore provider + core module identities after each test.
+
+    ``_import_provider`` drops the ``mnemosyne.*`` namespace and the provider
+    packages from ``sys.modules`` and re-imports them off a different sys.path
+    entry. Without this restore, any test module imported afterwards binds class
+    objects from the superseded module, and isinstance checks, string-form
+    monkeypatch targets and @patch counters break in that module.
+
+    Same failure class as incident t_c200045e; the fixture matches the one in
+    tests/test_936_scope_parity_audit.py and tests/test_apply_pending_replay_926.py.
+    """
+    saved_providers = {name: sys.modules.get(name) for name in PROVIDER_MODULES}
+    saved_mnemosyne = {
+        name: sys.modules.get(name)
+        for name in list(sys.modules)
+        if name == "mnemosyne" or name.startswith("mnemosyne.")
+    }
+    yield
+    for name in list(sys.modules):
+        if name == "mnemosyne" or name.startswith("mnemosyne."):
+            sys.modules.pop(name, None)
+    for name, module in saved_mnemosyne.items():
+        if module is not None:
+            sys.modules[name] = module
+    for name, module in saved_providers.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
 
 def _import_provider(package: str):
     for name in list(sys.modules):
