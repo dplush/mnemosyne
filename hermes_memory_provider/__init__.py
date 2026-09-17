@@ -49,8 +49,15 @@ def _write_approval_enabled() -> bool:
         return False
 
 
-def _stage_pending_write(payload: Dict[str, Any]) -> str:
-    """Stage a write to the pending store and return the record ID."""
+def _stage_pending_write(payload: Dict[str, Any],
+                         session_scope: Optional[str] = None) -> str:
+    """Stage a write to the pending store and return the record ID.
+
+    ``session_scope`` records the Hermes session the write originated from.
+    Replay runs in whatever session is active when the approval arrives, so the
+    originating scope has to be captured here or an approval after a session
+    switch lands the write in the wrong session (#936 review).
+    """
     from hermes_constants import get_hermes_home
     pid = uuid.uuid4().hex[:8]
     pending_dir = get_hermes_home() / "pending" / "memory"
@@ -66,6 +73,10 @@ def _stage_pending_write(payload: Dict[str, Any]) -> str:
         "summary": str(payload.get("content") or "")[:200],
         "created_at": time.time(),
     }
+    if session_scope:
+        # Top-level (not inside payload) so it is provenance about the staged
+        # record rather than an argument to replay.
+        record["session_scope"] = session_scope
     (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
     return pid
 
@@ -2812,7 +2823,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "extract": extract,
                 "metadata": metadata,
                 "veracity": veracity,
-            })
+            }, session_scope=self._session_id)
             return json.dumps({
                 "status": "staged",
                 "pending_id": pid,
@@ -2891,7 +2902,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "veracity": payload.get("veracity"),
                     "memory_id": payload.get("memory_id"),
                     "replacement_id": payload.get("replacement_id"),
-                })
+                }, session_scope=self._session_id)
                 # PR #926 finding 7: 'staged' carries RAW pending IDs
                 # (strings) so a client can forward response['staged']
                 # verbatim to mnemosyne_apply_pending; action metadata
@@ -3547,6 +3558,35 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     failed.append({"id": pid, "error": "id mismatch"})
                     continue
                 payload = record.get("payload", {})
+
+                # Session binding (#936 review): a staged record belongs to the
+                # session it was staged from. Replay runs in whatever session is
+                # active when the approval arrives, so writing through the active
+                # beam would land the record in the wrong session after a switch.
+                #
+                # Replay is therefore bound to the RECORDED session, which is what
+                # makes an approval arriving from another session write to the
+                # right place rather than fail. A differing arrival session is
+                # reported in the result (not silently absorbed) so the caller can
+                # see the switch; legacy records staged before `session_scope`
+                # existed fall back to the active beam.
+                recorded_scope = str(record.get("session_scope") or "").strip()
+                current_scope = str(getattr(self, "_session_id", "") or "").strip()
+                session_redirected = bool(
+                    recorded_scope and current_scope and recorded_scope != current_scope
+                )
+                # ONLY open a second beam when the scopes actually differ. Opening
+                # one unconditionally would take a second connection on the same
+                # store for the common same-session case, which is unnecessary and
+                # breaks callers holding the original beam.
+                replay_beam = self._beam
+                if session_redirected:
+                    from mnemosyne.core.beam import BeamMemory as _ReplayBeam
+                    replay_beam = _ReplayBeam(
+                        session_id=recorded_scope,
+                        db_path=getattr(self._beam, "db_path", None),
+                    )
+
                 # PR #926 finding 4: dispatch each staged record by the
                 # action captured at stage time, mirroring apply_beam_batch/
                 # _apply_one. 'update' targets the existing memory (no new
@@ -3562,7 +3602,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     if not content:
                         failed.append({"id": pid, "error": "empty content"})
                         continue
-                    memory_id = self._beam.remember(
+                    memory_id = replay_beam.remember(
                         content=content,
                         importance=float(payload.get("importance", 0.5)),
                         source=payload.get("source", "user"),
@@ -3576,7 +3616,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         ),
                     )
                     record_path.unlink(missing_ok=True)
-                    applied.append({"id": pid, "action": action, "memory_id": memory_id})
+                    _entry = {"id": pid, "action": action, "memory_id": memory_id}
+                    if session_redirected:
+                        _entry["session_redirected_from"] = current_scope
+                        _entry["session_replayed_into"] = recorded_scope
+                    applied.append(_entry)
                     continue
 
                 memory_id = str(payload.get("memory_id") or "").strip()
@@ -3588,7 +3632,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     continue
 
                 if action == "update":
-                    ok = self._beam.update_working(
+                    ok = replay_beam.update_working(
                         memory_id,
                         content=payload.get("content"),
                         importance=(
@@ -3598,9 +3642,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         ),
                     )
                 elif action == "forget":
-                    ok = self._beam.forget_working(memory_id)
+                    ok = replay_beam.forget_working(memory_id)
                 elif action == "invalidate":
-                    ok = self._beam.invalidate(
+                    ok = replay_beam.invalidate(
                         memory_id,
                         replacement_id=payload.get("replacement_id") or None,
                     )
@@ -3615,15 +3659,25 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     })
                     continue
                 record_path.unlink(missing_ok=True)
-                applied.append({"id": pid, "action": action, "memory_id": memory_id})
+                _entry = {"id": pid, "action": action, "memory_id": memory_id}
+                if session_redirected:
+                    _entry["session_redirected_from"] = current_scope
+                    _entry["session_replayed_into"] = recorded_scope
+                applied.append(_entry)
             except Exception as exc:
                 failed.append({"id": pid, "error": str(exc)})
 
+        _redirected = [a for a in applied if a.get("session_redirected_from")]
         return json.dumps({
             "applied": applied,
             "failed": failed,
             "applied_count": len(applied),
             "failed_count": len(failed),
+            # Additive: approvals replayed from a different session than
+            # the one they were staged in. The write still lands in the
+            # staging session; this field makes the switch visible to the
+            # caller rather than silently absorbed (#936 review).
+            "session_redirected_count": len(_redirected),
         })
 
     def _handle_model_refresh(self, args: Dict[str, Any]) -> str:
