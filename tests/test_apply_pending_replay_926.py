@@ -595,12 +595,17 @@ def test_staged_contains_raw_pending_ids_forwardable(provider_module_name, monke
             # Every staged ID resolves to a real pending record.
             for pid in staged:
                 assert (pending_dir / f"{pid}.json").is_file()
-            # Legacy surface keeps its historical pending_ids alias in
-            # sync with the unified 'staged' key.
-            if "pending_ids" in resp:
-                assert resp["pending_ids"] == staged
-            if "staged_count" in resp:
-                assert resp["staged_count"] == len(staged)
+            # Both surfaces expose the historical compatibility aliases
+            # unconditionally (#936 review). This assertion used to guard with
+            # `if "pending_ids" in resp`, which is exactly what let the two
+            # surfaces drift apart: the guard made a missing key look like a
+            # pass on the surface that omitted it.
+            assert "pending_ids" in resp, sorted(resp)
+            assert resp["pending_ids"] == staged
+            assert "count" in resp, sorted(resp)
+            assert resp["count"] == len(staged)
+            assert "staged_count" in resp, sorted(resp)
+            assert resp["staged_count"] == len(staged)
 
             # The client contract: forward response['staged'] verbatim to
             # mnemosyne_apply_pending. Before the fix this raised

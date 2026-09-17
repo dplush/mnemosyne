@@ -199,6 +199,67 @@ def _json_stable(value):
     return json.loads(json.dumps(value, sort_keys=True))
 
 
+def test_staged_pending_response_keys_match_across_providers(
+    tmp_path, monkeypatch, provider_modules
+):
+    """A staged mnemosyne_batch response must expose the SAME keys on both surfaces.
+
+    dplush's #936 review (blocking): the legacy surface returned the documented
+    ``pending_ids``/``count`` compatibility aliases while the standalone surface
+    returned only ``staged``/``staged_actions``/``staged_count``, so a client
+    forwarding ``pending_ids`` raised KeyError against one of the two supported
+    providers. The assertion is deliberately unconditional — an
+    ``if key in resp`` guard is what previously hid the divergence and is
+    forbidden here (the keys must exist on BOTH surfaces).
+    """
+    import types
+
+    stub = types.ModuleType("hermes_constants")
+    stub.get_hermes_home = lambda: tmp_path
+    monkeypatch.setitem(sys.modules, "hermes_constants", stub)
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+
+    responses = {}
+    for name, module in provider_modules.items():
+        monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"staged-parity-{name}",
+            hermes_home=str(tmp_path / name),
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+        responses[name] = json.loads(provider._handle_batch({
+            "operations": [
+                {"action": "remember", "content": "parity staged one"},
+                {"action": "forget", "memory_id": "00000000-dead-beef"},
+            ],
+        }))
+        provider._beam.conn.close()
+
+    legacy = responses["hermes_memory_provider"]
+    standalone = responses["mnemosyne_hermes"]
+
+    # Unconditional key presence on both surfaces.
+    for resp in (legacy, standalone):
+        assert "pending_ids" in resp, sorted(resp)
+        assert "count" in resp, sorted(resp)
+        assert "staged" in resp, sorted(resp)
+        assert "staged_actions" in resp, sorted(resp)
+        assert "staged_count" in resp, sorted(resp)
+
+    assert set(legacy) == set(standalone)
+    assert legacy["staged_count"] == standalone["staged_count"] == 2
+    assert legacy["count"] == standalone["count"] == 2
+    assert legacy["pending_ids"] == legacy["staged"]
+    assert standalone["pending_ids"] == standalone["staged"]
+    assert legacy["message"] == standalone["message"]
+    assert [e["action"] for e in legacy["staged_actions"]] == \
+        [e["action"] for e in standalone["staged_actions"]] == ["remember", "forget"]
+
+
 def test_provider_tool_sets_match(provider_modules):
     tool_sets = {name: set(_tool_schemas(module)) for name, module in provider_modules.items()}
 

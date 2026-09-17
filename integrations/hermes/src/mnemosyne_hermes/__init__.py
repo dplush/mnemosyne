@@ -46,7 +46,17 @@ def _write_approval_enabled() -> bool:
         return False
 
 
-def _stage_pending_write(payload: Dict[str, Any]) -> str:
+def _stage_pending_write(payload: Dict[str, Any],
+                         session_scope: Optional[str] = None,
+                         channel_scope: Optional[str] = None) -> str:
+    """Stage a write to the pending store and return the record ID.
+
+    ``session_scope`` / ``channel_scope`` record the Hermes scope the write
+    originated from. ``on_session_switch`` durably rebinds the Beam, and replay
+    runs in whatever session is active when the approval arrives, so the
+    originating scope must be captured here or an approval after a switch lands
+    the write in the wrong session (#936 review).
+    """
     from hermes_constants import get_hermes_home
     pid = uuid.uuid4().hex[:8]
     pending_dir = get_hermes_home() / "pending" / "memory"
@@ -60,6 +70,13 @@ def _stage_pending_write(payload: Dict[str, Any]) -> str:
         "summary": str(payload.get("content") or "")[:200],
         "created_at": time.time(),
     }
+    if session_scope:
+        # Top-level (not inside payload) so it is provenance about the staged
+        # record rather than an argument to replay.
+        record["session_scope"] = session_scope
+    if channel_scope:
+        # Same reasoning; a Beam write's channel is not always its session.
+        record["channel_scope"] = channel_scope
     (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
     return pid
 from datetime import datetime, timedelta, timezone
@@ -1895,6 +1912,67 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             lock_factory = getattr(threading, "RLock", threading.Lock)
             return self.__dict__.setdefault("_beam_access_lock", lock_factory())
 
+    @contextmanager
+    def _replay_scope_locked(self, session_scope: str, channel_scope: str = ""):
+        """Bind a staged replay to the scope its record was staged from.
+
+        Approval can arrive after ``on_session_switch()`` durably rebound the
+        Beam, so a write staged in session A could otherwise be committed under
+        session B (#936 review). The live Beam's session/channel are swapped for
+        the duration of the replay and restored afterwards, under the Beam
+        access lock, so no concurrent provider operation can observe the swap.
+
+        The recorded scope is applied verbatim: it was already effective when
+        the record was staged, so it must NOT be passed back through
+        ``_beam_session_scope``/``_provider_session_id``, which would normalize
+        it a second time (``hermes_hermes_...``) or displace it with the current
+        gateway key.
+
+        Yields the Beam to replay against. An empty ``session_scope`` means
+        "leave the active beam alone" (legacy record, or same-session approval).
+        """
+        beam = self._beam
+        if beam is None or not session_scope or not hasattr(beam, "session_id"):
+            yield beam
+            return
+
+        with self._ensure_beam_access_lock():
+            beam_session = getattr(beam, "session_id", None)
+            beam_channel = getattr(beam, "channel_id", None)
+            had_beam_channel = hasattr(beam, "channel_id")
+            memory = getattr(self, "_memory", None)
+            memory_session = getattr(memory, "session_id", None) if memory is not None else None
+            memory_channel = getattr(memory, "channel_id", None) if memory is not None else None
+            had_memory_channel = memory is not None and hasattr(memory, "channel_id")
+
+            effective_channel = str(channel_scope or "")
+            if not effective_channel and beam_channel is not None and beam_channel == beam_session:
+                # The channel was tracking the session (BeamMemory's default),
+                # so it has to track the recorded session as well. An explicitly
+                # pinned channel is only rebound from the record itself.
+                effective_channel = session_scope
+            try:
+                beam.session_id = session_scope
+                if effective_channel and had_beam_channel:
+                    beam.channel_id = effective_channel
+                if memory is not None and memory_session is not None:
+                    # _memory is a second view of the same session; keep it in
+                    # step for the duration of the replay.
+                    memory.session_id = session_scope
+                    if effective_channel and had_memory_channel:
+                        memory.channel_id = effective_channel
+                yield beam
+            finally:
+                if beam_session is not None:
+                    beam.session_id = beam_session
+                if had_beam_channel:
+                    beam.channel_id = beam_channel
+                if memory is not None:
+                    if memory_session is not None:
+                        memory.session_id = memory_session
+                    if had_memory_channel:
+                        memory.channel_id = memory_channel
+
     def _provider_session_id(self, session_id: str) -> str:
         """Normalize a Hermes session ID without displacing gateway scope."""
         stable_scope = getattr(self, "_gateway_session_key", "") or str(
@@ -2391,7 +2469,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 "extract_entities": extract_entities,
                 "extract": extract, "metadata": metadata,
                 "veracity": veracity,
-            })
+            }, session_scope=self._session_id,
+               channel_scope=str(getattr(self._beam, "channel_id", "") or ""))
             return json.dumps({
                 "status": "staged", "pending_id": pid,
                 "content_preview": content[:100],
@@ -2470,18 +2549,26 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     "veracity": payload.get("veracity"),
                     "memory_id": payload.get("memory_id"),
                     "replacement_id": payload.get("replacement_id"),
-                })
+                }, session_scope=self._session_id,
+                   channel_scope=str(getattr(self._beam, "channel_id", "") or ""))
                 # PR #926 finding 7: 'staged' carries RAW pending IDs
                 # (strings) so a client can forward response['staged']
                 # verbatim to mnemosyne_apply_pending; action metadata
                 # lives in the additive 'staged_actions' field.
                 staged.append(pid)
                 staged_actions.append({"action": action, "pending_id": pid})
+            # Response parity (#936 review): the legacy surface returns
+            # 'pending_ids'/'count' alongside 'staged'/'staged_count', and a
+            # client that forwards the documented compatibility key reads it on
+            # both. Identical keys AND identical values, message included, so the
+            # surfaces cannot drift apart again.
             return json.dumps({
                 "status": "staged", "staged": staged,
+                "pending_ids": staged,
                 "staged_actions": staged_actions,
                 "staged_count": len(staged),
-                "message": "Batch write staged for approval. Use mnemosyne_apply_pending to commit.",
+                "count": len(staged),
+                "message": f"{len(staged)} writes staged for approval. Use mnemosyne_apply_pending to commit.",
             })
 
         return json.dumps(apply_beam_batch(
@@ -3121,6 +3208,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     failed.append({"id": pid, "error": "id mismatch"})
                     continue
                 p = record.get("payload", {})
+                # Scope binding (#936 review): the record belongs to the session
+                # it was staged from. on_session_switch() durably rebinds the
+                # Beam, so without this an approval arriving after a switch
+                # would mutate/store under the NEW session. Replay is bound to
+                # the recorded scope; a differing arrival scope is reported, not
+                # silently absorbed. Legacy records (no recorded scope) replay
+                # through the active beam.
+                recorded_scope = str(record.get("session_scope") or "").strip()
+                recorded_channel = str(record.get("channel_scope") or "").strip()
+                current_scope = str(getattr(self, "_session_id", "") or "").strip()
+                session_redirected = bool(
+                    recorded_scope and current_scope and recorded_scope != current_scope
+                )
+                replay_scope = recorded_scope if session_redirected else ""
+                replay_channel = recorded_channel if session_redirected else ""
+
                 # PR #926 finding 4: dispatch each approved record by the
                 # action captured at stage time, mirroring apply_beam_batch/
                 # _apply_one. update targets the existing memory (no new
@@ -3131,67 +3234,107 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 # failure.
                 action = p.get("action") or "remember"
 
-                if action == "remember":
-                    c = p.get("content", "")
-                    if not c:
-                        failed.append({"id": pid, "error": "empty content"})
+                with self._replay_scope_locked(
+                    replay_scope, replay_channel
+                ) as replay_beam:
+                    if replay_beam is None:
+                        failed.append({"id": pid, "error": "memory unavailable"})
                         continue
-                    mid = self._beam.remember(
-                        content=c,
-                        importance=float(p.get("importance", 0.5)),
-                        source=p.get("source", "user"),
-                        scope=p.get("scope", self._default_scope),
-                        valid_until=p.get("valid_until"),
-                        extract_entities=bool(p.get("extract_entities", False)),
-                        extract=bool(p.get("extract", False)),
-                        metadata=p.get("metadata"),
-                        veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
-                    )
+
+                    if action == "remember":
+                        c = p.get("content", "")
+                        if not c:
+                            failed.append({"id": pid, "error": "empty content"})
+                            continue
+                        mid = replay_beam.remember(
+                            content=c,
+                            importance=float(p.get("importance", 0.5)),
+                            source=p.get("source", "user"),
+                            scope=p.get("scope", self._default_scope),
+                            valid_until=p.get("valid_until"),
+                            extract_entities=bool(p.get("extract_entities", False)),
+                            extract=bool(p.get("extract", False)),
+                            metadata=p.get("metadata"),
+                            veracity=clamp_veracity(p.get("veracity"), context="apply_pending"),
+                        )
+                        rp.unlink(missing_ok=True)
+                        entry = {"id": pid, "action": action, "memory_id": mid}
+                        if session_redirected:
+                            entry["session_redirected_from"] = current_scope
+                            entry["session_replayed_into"] = recorded_scope
+                        applied.append(entry)
+                        continue
+
+                    memory_id = str(p.get("memory_id") or "").strip()
+                    if not memory_id:
+                        failed.append({
+                            "id": pid,
+                            "error": f"memory_id is required for action {action}",
+                        })
+                        continue
+
+                    replacement_id = p.get("replacement_id") or None
+                    if action == "update":
+                        ok = replay_beam.update_working(
+                            memory_id,
+                            content=p.get("content"),
+                            importance=(
+                                float(p["importance"])
+                                if p.get("importance") is not None
+                                else None
+                            ),
+                        )
+                    elif action == "forget":
+                        ok = replay_beam.forget_working(memory_id)
+                    elif action == "invalidate":
+                        ok = replay_beam.invalidate(
+                            memory_id,
+                            replacement_id=replacement_id,
+                        )
+                    else:
+                        failed.append({"id": pid, "error": f"unknown action: {action}"})
+                        continue
+
+                    if not ok:
+                        failed.append({
+                            "id": pid, "action": action,
+                            "memory_id": memory_id, "error": "memory_not_found",
+                        })
+                        continue
+                    # Audit parity with the direct handlers (#936 review): an
+                    # approved destructive mutation is audited exactly like the
+                    # same call made with the approval gate off.
+                    if action == "forget":
+                        self._audit_event(
+                            "forget", memory_id=memory_id, bank="private",
+                            source_tool="mnemosyne_apply_pending",
+                        )
+                    elif action == "invalidate":
+                        self._audit_event(
+                            "invalidate", memory_id=memory_id, bank="private",
+                            source_tool="mnemosyne_apply_pending",
+                            metadata=(
+                                {"replacement_id": replacement_id, "invalidated": True}
+                                if replacement_id
+                                else {"invalidated": True}
+                            ),
+                        )
                     rp.unlink(missing_ok=True)
-                    applied.append({"id": pid, "action": action, "memory_id": mid})
-                    continue
-
-                memory_id = str(p.get("memory_id") or "").strip()
-                if not memory_id:
-                    failed.append({
-                        "id": pid,
-                        "error": f"memory_id is required for action {action}",
-                    })
-                    continue
-
-                if action == "update":
-                    ok = self._beam.update_working(
-                        memory_id,
-                        content=p.get("content"),
-                        importance=(
-                            float(p["importance"])
-                            if p.get("importance") is not None
-                            else None
-                        ),
-                    )
-                elif action == "forget":
-                    ok = self._beam.forget_working(memory_id)
-                elif action == "invalidate":
-                    ok = self._beam.invalidate(
-                        memory_id,
-                        replacement_id=p.get("replacement_id") or None,
-                    )
-                else:
-                    failed.append({"id": pid, "error": f"unknown action: {action}"})
-                    continue
-
-                if not ok:
-                    failed.append({
-                        "id": pid, "action": action,
-                        "memory_id": memory_id, "error": "memory_not_found",
-                    })
-                    continue
-                rp.unlink(missing_ok=True)
-                applied.append({"id": pid, "action": action, "memory_id": memory_id})
+                    entry = {"id": pid, "action": action, "memory_id": memory_id}
+                    if session_redirected:
+                        entry["session_redirected_from"] = current_scope
+                        entry["session_replayed_into"] = recorded_scope
+                    applied.append(entry)
             except Exception as exc:
                 failed.append({"id": pid, "error": str(exc)})
+        redirected = [a for a in applied if a.get("session_redirected_from")]
         return json.dumps({"applied": applied, "failed": failed,
-                           "applied_count": len(applied), "failed_count": len(failed)})
+                           "applied_count": len(applied), "failed_count": len(failed),
+                           # Additive, mirrors hermes_memory_provider: approvals
+                           # replayed from a different session than they were
+                           # staged in. The write still lands in the staging
+                           # session; this makes the switch visible (#936 review).
+                           "session_redirected_count": len(redirected)})
 
     def _handle_model_card(self, args: Dict[str, Any]) -> str:
         category = (args.get("category") or "").strip()

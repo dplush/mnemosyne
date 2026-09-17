@@ -165,3 +165,96 @@ def test_replay_restores_the_staging_session_not_the_active_one(monkeypatch, tmp
     assert entry.get("session_replayed_into") == "hermes_sess-a"
     assert entry.get("session_redirected_from") == "hermes_sess-b"
     assert applied.get("session_redirected_count") == 1
+
+
+# ---------------------------------------------------------------------------
+# CodeRabbit follow-up on the same head: the redirected-session coverage
+# above exercised only `remember`. update/forget/invalidate take the same
+# scope-binding path and must be covered too, or a regression in the
+# non-remember branch would pass unnoticed.
+# ---------------------------------------------------------------------------
+
+
+def _stage_batch(prov, ops):
+    resp = json.loads(prov.handle_tool_call("mnemosyne_batch", {"operations": ops}))
+    assert resp["status"] == "staged", resp
+    return _staged_ids(resp)
+
+
+def _seed(prov, content):
+    resp = json.loads(prov.handle_tool_call(
+        "mnemosyne_remember", {"content": content, "scope": "session"}
+    ))
+    assert resp["status"] == "stored", resp
+    return resp["memory_id"]
+
+
+def _working_row(db: Path, memory_id: str):
+    conn = sqlite3.connect(str(db))
+    try:
+        return conn.execute(
+            "SELECT session_id, content, superseded_by, valid_until "
+            "FROM working_memory WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("action", ["update", "forget", "invalidate"])
+def test_redirected_replay_binds_every_action_to_the_staging_session(
+    action, monkeypatch, tmp_path
+):
+    """Each non-remember action must target the STAGING session after a switch.
+
+    Staged in sess-a, approved while sess-b is active: the operation must apply
+    to sess-a's row and report the redirect. Without the scope binding, the
+    replayed mutation would run through sess-b's beam and miss the row
+    entirely (update/forget are session-scoped SQL) or leave sess-a untouched.
+    """
+    module = _import_provider("hermes_memory_provider")
+    with _pending_home(monkeypatch, tmp_path) as pending_dir:
+        a = _provider(module, tmp_path, "sess-a")
+        # Seed while the gate is OFF so writes commit directly, then turn the
+        # approval gate on for the staged operation.
+        target = _seed(a, f"target for {action}")
+        op = {"action": action, "memory_id": target}
+        if action == "update":
+            op["content"] = "updated under sess-a"
+        if action == "invalidate":
+            op["replacement_id"] = _seed(a, "replacement under sess-a")
+        _force_approval_gate(module, monkeypatch)
+        pids = _stage_batch(a, [op])
+        assert (pending_dir / f"{pids[0]}.json").is_file()
+
+        # Session switch before the approval arrives.
+        b = _provider(module, tmp_path, "sess-b")
+        applied = json.loads(b.handle_tool_call(
+            "mnemosyne_apply_pending", {"pending_ids": pids}
+        ))
+        print(f"{action} apply result:", applied)
+
+    assert applied["applied_count"] == 1, applied
+    assert applied["failed_count"] == 0, applied
+    entry = applied["applied"][0]
+    assert entry["action"] == action
+    assert entry["memory_id"] == target
+    assert entry["session_replayed_into"] == "hermes_sess-a"
+    assert entry["session_redirected_from"] == "hermes_sess-b"
+    assert applied["session_redirected_count"] == 1
+    # The record is consumed only by a successful replay.
+    assert not (pending_dir / f"{pids[0]}.json").exists()
+
+    db = tmp_path / "mnemosyne-data" / "private" / "mnemosyne.db"
+    row = _working_row(db, target)
+    if action == "forget":
+        assert row is None, "the staging session's row must be the one deleted"
+    elif action == "update":
+        assert row is not None
+        assert row[0] == "hermes_sess-a", row
+        assert row[1] == "updated under sess-a", row
+    else:  # invalidate
+        assert row is not None
+        assert row[0] == "hermes_sess-a", row
+        assert row[2] is not None, "superseded_by must chain to the replacement"
+        assert row[3] is not None, "valid_until must be set"
