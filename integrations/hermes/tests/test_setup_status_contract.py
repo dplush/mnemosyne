@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 from mnemosyne_hermes import MnemosyneMemoryProvider, install
@@ -60,7 +61,10 @@ assert 'mnemosyne_hermes' not in sys.modules
 
 
 def test_package_entry_point_targets_package_and_preserves_cli():
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        tomllib = pytest.importorskip("tomli")
 
     metadata = tomllib.loads((HERMES_PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
     entry_points = metadata["project"]["entry-points"]
