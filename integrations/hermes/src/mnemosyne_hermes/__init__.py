@@ -1356,26 +1356,53 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     status["reflect"] = safe_reflect
 
             patterns = provider_config.get("ignore_patterns")
-            if isinstance(patterns, list):
-                status["ignore_patterns"] = f"{len(patterns)} configured"
+            if isinstance(patterns, (str, list, tuple, set)):
+                raw_patterns = (
+                    patterns.replace(",", "\n").splitlines()
+                    if isinstance(patterns, str)
+                    else patterns
+                )
+                parsed_patterns = {
+                    str(value).strip()
+                    for value in raw_patterns
+                    if str(value).strip()
+                }
+                status["ignore_patterns"] = f"{len(parsed_patterns)} configured"
 
             skip_contexts = provider_config.get("skip_contexts")
-            if isinstance(skip_contexts, str):
+            if isinstance(skip_contexts, (str, list, tuple, set)):
                 allowed_contexts = {
                     "background", "cron", "flush", "primary", "skill_loop", "subagent"
                 }
-                contexts = [
-                    value.strip()
-                    for value in skip_contexts.split(",")
-                    if value.strip() in allowed_contexts
-                ]
+                raw_contexts = (
+                    skip_contexts.split(",")
+                    if isinstance(skip_contexts, str)
+                    else skip_contexts
+                )
+                contexts = []
+                for value in raw_contexts:
+                    normalized = str(value).strip()
+                    if normalized in allowed_contexts and normalized not in contexts:
+                        contexts.append(normalized)
+                    if len(contexts) >= 32:
+                        break
                 status["skip_contexts"] = ",".join(contexts)
 
             sync_roles = provider_config.get("sync_roles")
-            if isinstance(sync_roles, list):
-                status["sync_roles"] = [
-                    value for value in sync_roles if value in {"assistant", "user"}
-                ]
+            if isinstance(sync_roles, (str, list, tuple, set)):
+                raw_roles = (
+                    sync_roles.split(",")
+                    if isinstance(sync_roles, str)
+                    else sync_roles
+                )
+                roles = []
+                for value in raw_roles:
+                    normalized = str(value).strip().lower()
+                    if normalized in {"assistant", "user"} and normalized not in roles:
+                        roles.append(normalized)
+                    if len(roles) >= 2:
+                        break
+                status["sync_roles"] = roles
 
             if "tools" in provider_config:
                 tools = provider_config.get("tools")

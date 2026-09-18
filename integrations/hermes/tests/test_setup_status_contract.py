@@ -177,6 +177,35 @@ def test_status_config_rejects_forged_tools_and_terminal_control_sequences():
     assert "\x1b" not in rendered
 
 
+def test_status_config_normalizes_all_supported_provider_setting_shapes():
+    status = MnemosyneMemoryProvider().get_status_config(
+        {
+            "ignore_patterns": " one, two\n one ",
+            "skip_contexts": ("cron", "cron", "invalid", "flush"),
+            "sync_roles": {"USER", "assistant", "unknown"},
+        }
+    )
+
+    assert status["ignore_patterns"] == "2 configured"
+    assert status["skip_contexts"] == "cron,flush"
+    assert set(status["sync_roles"]) == {"user", "assistant"}
+    assert len(status["skip_contexts"]) < 256
+    assert len(status["sync_roles"]) == 2
+
+
+def test_status_config_bounds_repeated_context_and_role_values():
+    status = MnemosyneMemoryProvider().get_status_config(
+        {
+            "skip_contexts": ["cron"] * 10_000,
+            "sync_roles": ["user"] * 10_000,
+        }
+    )
+
+    assert status["skip_contexts"] == "cron"
+    assert status["sync_roles"] == ["user"]
+    assert len(repr(status)) < 256
+
+
 class _BrokenConfig(dict):
     def get(self, key, default=None):
         raise RuntimeError("must fail soft")
