@@ -754,7 +754,7 @@ def test_replay_keeps_the_live_beam_identity(
             assert row is not None
             assert row[0] == "hermes_sess-a"
             # A second BeamMemory would have written (None, None) here.
-            assert row[1], "replay must not strip the live beam's author identity"
+            assert row[1] == "bob", "replay must not strip the live beam's author identity"
 
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
