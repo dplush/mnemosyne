@@ -180,6 +180,8 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
   rotates the agent session through `/new`, `/resume`, `/branch`, undo, or context
   compression, so subsequent writes, reads, and tools use the active session.
 
+- **After-commit event hooks are now savepoint-aware (#963).** `forget()` defers `MEMORY_INVALIDATED` past a caller-owned transaction so the event fires on commit and is suppressed on rollback, but a `ROLLBACK TO <savepoint>` inside the caller's transaction undid the delete while the queued hook survived, publishing an invalidation for a row that was never deleted. The connection now mirrors savepoint scope for its hook queue: hooks queued inside a savepoint are discarded when it rolls back and kept when it releases, and a bare `ROLLBACK` issued as raw SQL clears them like `rollback()` does. Savepoints managed through a cursor rather than the connection are not mirrored, and an untracked name is left alone rather than guessed at, so cursor-issued core savepoints (which never span hook registration) are unaffected.
+
 ## [3.15.1] - 2026-07-30
 
 ### Fixed

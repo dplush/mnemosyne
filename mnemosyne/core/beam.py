@@ -1907,6 +1907,15 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     )
 
 
+_SAVEPOINT_STMT_RE = re.compile(
+    r"""^\s*(?P<verb>SAVEPOINT|RELEASE|ROLLBACK)\s*"""
+    r"""(?:(?:TRANSACTION|TO|SAVEPOINT)\s+)*"""
+    r"""(?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|\[(?P<br>[^\]]+)\]|"""
+    r"""`(?P<bt>[^`]+)`|(?P<bare>[^\s;]+))?""",
+    re.IGNORECASE,
+)
+
+
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
 
@@ -1940,6 +1949,13 @@ class _BeamConnection(sqlite3.Connection):
         # until data is actually durable instead of firing on savepoint
         # release inside a caller-owned transaction.
         self._after_commit_hooks: List[Callable[[], None]] = []
+        # Savepoint scope marks for the hook queue (see #963): each entry
+        # is (savepoint name, queue length when taken), maintained by the
+        # execute() override below. A ROLLBACK TO discards hooks queued
+        # inside the rolled-back savepoint; RELEASE keeps them (merged
+        # into the outer scope); full commit()/rollback() resets the
+        # stack. Names are matched case-insensitively, innermost first.
+        self._savepoint_hook_marks: List[Tuple[str, int]] = []
 
     def _next_savepoint_name(self, purpose: str) -> str:
         """Return a connection-local, SQLite-safe savepoint identifier."""
@@ -1955,6 +1971,7 @@ class _BeamConnection(sqlite3.Connection):
         had_transaction = self.in_transaction
         super().commit()
         if had_transaction:
+            self._savepoint_hook_marks.clear()
             self._drain_after_commit_hooks()
 
     def rollback(self) -> None:
@@ -1963,7 +1980,79 @@ class _BeamConnection(sqlite3.Connection):
         # is deliberate — if the rollback itself fails the connection is
         # untrustworthy and queued side effects must not survive it.
         self._after_commit_hooks.clear()
+        self._savepoint_hook_marks.clear()
         super().rollback()
+
+    def execute(self, sql, *args, **kwargs):
+        """Execute SQL, mirroring savepoint scope for after-commit hooks.
+
+        Raw SAVEPOINT/RELEASE/ROLLBACK statements bypass commit()/
+        rollback(), so without interception a ROLLBACK TO would undo a
+        hook's data while the hook itself stays queued and fires a
+        phantom event on the next commit (see #963). Bookkeeping runs
+        only after the statement succeeds: a failed statement changes
+        neither SQLite state nor our mirror of it.
+        """
+        cursor = super().execute(sql, *args, **kwargs)
+        self._track_savepoint_statement(sql)
+        return cursor
+
+    def _track_savepoint_statement(self, sql) -> None:
+        """Mirror one savepoint statement onto the hook-queue marks.
+
+        Only statements issued through this connection's execute() are
+        visible here: savepoints managed through a cursor bypass the
+        mirror. Core cursor-issued savepoints never span hook
+        registration, and an untracked name is left alone rather than
+        guessed at (dropping outer hooks would silently lose real
+        events). Duplicate names resolve innermost-first.
+        """
+        if not isinstance(sql, str):
+            return
+        head = sql.lstrip()[:9].upper()
+        if not (
+            head.startswith("SAVEPOINT")
+            or head.startswith("RELEASE")
+            or head.startswith("ROLLBACK")
+        ):
+            return
+        match = _SAVEPOINT_STMT_RE.match(sql)
+        if match is None:
+            return
+        verb = match.group("verb").upper()
+        name = (
+            match.group("dq")
+            or match.group("sq")
+            or match.group("br")
+            or match.group("bt")
+            or match.group("bare")
+        )
+        if name is None:
+            if verb == "ROLLBACK":
+                # Bare ROLLBACK via raw SQL ends the whole transaction:
+                # same treatment as rollback().
+                self._after_commit_hooks.clear()
+                self._savepoint_hook_marks.clear()
+            return
+        key = name.casefold()
+        marks = self._savepoint_hook_marks
+        if verb == "SAVEPOINT":
+            marks.append((key, len(self._after_commit_hooks)))
+        elif verb == "RELEASE":
+            # Merges the savepoint (and anything nested in it) into the
+            # outer scope: queued hooks survive, marks do not.
+            for i in range(len(marks) - 1, -1, -1):
+                mark_name, _ = marks[i]
+                del marks[i]
+                if mark_name == key:
+                    break
+        else:  # ROLLBACK TO — the savepoint itself stays active.
+            for i in range(len(marks) - 1, -1, -1):
+                mark_name, mark_len = marks[i]
+                if mark_name == key:
+                    del self._after_commit_hooks[mark_len:]
+                    del marks[i + 1 :]
+                    break
 
     def _drain_after_commit_hooks(self) -> None:
         """Fire queued after-commit hooks once each; never raises.
@@ -1986,6 +2075,7 @@ class _BeamConnection(sqlite3.Connection):
         had_transaction = self.in_transaction
         super().commit()
         if had_transaction:
+            self._savepoint_hook_marks.clear()
             self._drain_after_commit_hooks()
 
 

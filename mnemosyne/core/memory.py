@@ -734,8 +734,10 @@ class Mnemosyne:
         caller-owned transaction is still open, emitting now would fire
         before the caller's commit — a phantom event if they roll back —
         so queue an after-commit hook on the connection instead. The hook
-        fires on the next real commit and is discarded unseen on rollback.
-        On a non-BEAM connection (no hook support) fall back to immediate
+        fires on the next real commit and is discarded unseen on rollback,
+        including a ROLLBACK TO a savepoint taken before the hook was
+        queued (the connection mirrors savepoint scope; see #963). On a
+        non-BEAM connection (no hook support) fall back to immediate
         emission.
         """
         conn = self.conn

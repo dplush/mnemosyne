@@ -177,3 +177,42 @@ def test_no_raw_transaction_ending_sql(tmp_path: Path):
             lineno = text.count("\n", 0, m.start()) + 1
             offenders.append(f"{p.name}:{lineno}")
     assert offenders == []
+
+
+def test_savepoint_rollback_discards_queued_event(tmp_path: Path):
+    """A ROLLBACK TO undoing forget() must also discard its queued event.
+
+    Regression for the savepoint gap in #963: the hook queue is
+    connection-wide, so without savepoint tracking the row comes back
+    while MEMORY_INVALIDATED still fires on commit.
+    """
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("savepoint row", source="test")
+    mem.conn.execute("BEGIN")
+    mem.conn.execute("SAVEPOINT caller")
+    assert mem.forget(mid) is True
+    mem.conn.execute("ROLLBACK TO caller")
+    mem.conn.execute("RELEASE caller")
+    mem.conn.commit()
+
+    assert events == []
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 1
+
+
+def test_released_savepoint_keeps_queued_event(tmp_path: Path):
+    """RELEASE merges into the outer scope: the event fires on commit."""
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("released row", source="test")
+    mem.conn.execute("BEGIN")
+    mem.conn.execute("SAVEPOINT caller")
+    assert mem.forget(mid) is True
+    mem.conn.execute("RELEASE caller")
+    assert events == []
+    mem.conn.commit()
+
+    assert events == [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 0
