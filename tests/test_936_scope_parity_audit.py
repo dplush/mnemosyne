@@ -653,6 +653,64 @@ def test_replayed_invalidate_emits_audit_event_with_replacement_metadata(
 
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
+def test_replayed_forget_and_invalidate_audit_the_staging_session(
+    provider_module_name, monkeypatch, tmp_path
+):
+    """The audit row names the RECORDED scope, like the mutation it describes.
+
+    A forget/invalidate staged in session A but approved in session B lands in
+    A; the audit trail must not claim it happened under the approving session
+    (CodeRabbit review 5241469678, Finding A).
+    """
+    module = _import_provider(provider_module_name)
+    with _pending_home(monkeypatch, tmp_path):
+        with _provider(module, tmp_path, "sess-a") as prov_a:
+            forget_target = json.loads(prov_a.handle_tool_call(
+                "mnemosyne_remember", {"content": "redirect audit forget target"}
+            ))
+            invalidate_target = json.loads(prov_a.handle_tool_call(
+                "mnemosyne_remember", {"content": "redirect audit invalidate target"}
+            ))
+            replacement = json.loads(prov_a.handle_tool_call(
+                "mnemosyne_remember", {"content": "redirect audit replacement"}
+            ))
+            _force_approval_gate(module, monkeypatch)
+            pids = _stage_ops_in_session_a(prov_a, [
+                {"action": "forget", "memory_id": forget_target["memory_id"]},
+                {
+                    "action": "invalidate",
+                    "memory_id": invalidate_target["memory_id"],
+                    "replacement_id": replacement["memory_id"],
+                },
+            ])
+
+        with _provider(module, tmp_path, "sess-b") as prov_b:
+            applied = json.loads(prov_b.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": pids}
+            ))
+            assert applied["applied_count"] == 2, applied
+            assert applied["failed_count"] == 0, applied
+            assert applied["session_redirected_count"] == 2, applied
+            # The applied entries keep reporting the redirect...
+            for entry in applied["applied"]:
+                assert entry["session_replayed_into"] == "hermes_sess-a", entry
+                assert entry["session_redirected_from"] == "hermes_sess-b", entry
+            events = _audit_events(prov_b)
+
+    replay_events = [
+        e for e in events
+        if e["source_tool"] == "mnemosyne_apply_pending"
+        and e["action"] in ("forget", "invalidate")
+    ]
+    assert len(replay_events) == 2, events
+    assert {e["action"] for e in replay_events} == {"forget", "invalidate"}
+    for event in replay_events:
+        # ...and the audit trail names the staging scope the mutation landed
+        # in, not the approving session it was replayed from.
+        assert event["session_id"] == "hermes_sess-a", event
+
+
+@pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
 def test_failed_replay_emits_no_audit_event(
     provider_module_name, monkeypatch, tmp_path
 ):

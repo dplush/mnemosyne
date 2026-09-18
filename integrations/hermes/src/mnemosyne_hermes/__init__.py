@@ -3313,16 +3313,22 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         continue
                     # Audit parity with the direct handlers (#936 review): an
                     # approved destructive mutation is audited exactly like the
-                    # same call made with the approval gate off.
+                    # same call made with the approval gate off. Session-scoped
+                    # audit rows name the RECORDED scope the mutation actually
+                    # landed in, not the approving session it was replayed from
+                    # (CodeRabbit review 5241469678); legacy records with no
+                    # recorded scope fall back to the current session.
                     if action == "forget":
                         self._audit_event(
                             "forget", memory_id=memory_id, bank="private",
                             source_tool="mnemosyne_apply_pending",
+                            session_id=recorded_scope or current_scope,
                         )
                     elif action == "invalidate":
                         self._audit_event(
                             "invalidate", memory_id=memory_id, bank="private",
                             source_tool="mnemosyne_apply_pending",
+                            session_id=recorded_scope or current_scope,
                             metadata=(
                                 {"replacement_id": replacement_id, "invalidated": True}
                                 if replacement_id
