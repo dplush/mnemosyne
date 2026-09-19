@@ -132,6 +132,15 @@ def _restore_pending_claim(claim_path: Path, record_path: Path) -> None:
         raise
 
 
+def _cleanup_committed_pending_claim(claim_path: Path) -> Optional[str]:
+    """Remove a committed claim, retaining it for recovery on failure."""
+    try:
+        claim_path.unlink(missing_ok=True)
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
 def _guard_selected_site_packages_python_compatibility(selected_site_packages: Path) -> None:
     """Reject a selected virtualenv that targets another Python minor version."""
     selected_site_packages = selected_site_packages.resolve()
@@ -3665,6 +3674,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         pending_dir = pending_dir.resolve()
         applied = []
         failed = []
+        cleanup_failed = []
 
         for pid in pending_ids:
             # Validate pid is a safe identifier: no path traversal
@@ -3787,7 +3797,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             source_tool="mnemosyne_apply_pending",
                             session_id=recorded_scope or current_scope,
                         )
-                        claim_path.unlink(missing_ok=True)
+                        cleanup_error = _cleanup_committed_pending_claim(claim_path)
+                        if cleanup_error is not None:
+                            cleanup_failed.append({"id": pid, "error": cleanup_error})
                         _entry = {"id": pid, "action": action, "memory_id": memory_id}
                         if session_redirected:
                             _entry["session_redirected_from"] = current_scope
@@ -3864,7 +3876,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                 else {"invalidated": True}
                             ),
                         )
-                    claim_path.unlink(missing_ok=True)
+                    cleanup_error = _cleanup_committed_pending_claim(claim_path)
+                    if cleanup_error is not None:
+                        cleanup_failed.append({"id": pid, "error": cleanup_error})
                     _entry = {"id": pid, "action": action, "memory_id": memory_id}
                     if session_redirected:
                         _entry["session_redirected_from"] = current_scope
@@ -3888,6 +3902,8 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             "failed": failed,
             "applied_count": len(applied),
             "failed_count": len(failed),
+            "cleanup_failed": cleanup_failed,
+            "cleanup_failed_count": len(cleanup_failed),
             # Additive: approvals replayed from a different session than
             # the one they were staged in. The write still lands in the
             # staging session; this field makes the switch visible to the

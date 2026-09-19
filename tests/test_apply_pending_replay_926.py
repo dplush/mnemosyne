@@ -574,6 +574,85 @@ def test_apply_pending_concurrent_providers_mutate_once(
     "hermes_memory_provider",
     "mnemosyne_hermes",
 ])
+@pytest.mark.parametrize("action", ["remember", "update", "forget", "invalidate"])
+def test_apply_pending_cleanup_failure_does_not_make_committed_action_replayable(
+    provider_module_name, action, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+        payload = {"action": action}
+        if action == "remember":
+            payload["content"] = "committed once"
+        else:
+            payload["memory_id"] = "memory-target"
+            if action == "update":
+                payload["content"] = "updated once"
+
+        record_path = _write_pending_record(pending_dir, "cleanup1", payload)
+        mutation_calls = []
+
+        def remember(**kwargs):
+            mutation_calls.append(("remember", kwargs))
+            return "memory-created"
+
+        provider = _stub_replay_provider(module, remember)
+
+        def mutate(memory_id, *args, **kwargs):
+            mutation_calls.append((action, memory_id, args, kwargs))
+            return True
+
+        if action == "update":
+            provider._beam.update_working = mutate
+        elif action == "forget":
+            provider._beam.forget_working = mutate
+        elif action == "invalidate":
+            provider._beam.invalidate = mutate
+
+        real_unlink = Path.unlink
+        cleanup_attempts = 0
+
+        def fail_first_claim_cleanup(path, *args, **kwargs):
+            nonlocal cleanup_attempts
+            if path.suffix == ".claim":
+                cleanup_attempts += 1
+                if cleanup_attempts == 1:
+                    raise PermissionError("simulated post-commit claim cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_first_claim_cleanup)
+
+        first = json.loads(provider._handle_apply_pending({
+            "pending_ids": ["cleanup1"],
+        }))
+
+        assert first["applied_count"] == 1
+        assert first["failed_count"] == 0
+        assert first["cleanup_failed_count"] == 1
+        assert first["cleanup_failed"] == [{
+            "id": "cleanup1",
+            "error": "simulated post-commit claim cleanup failure",
+        }]
+        assert len(mutation_calls) == 1
+        assert not record_path.exists()
+        assert len(list(pending_dir.glob("*.claim"))) == 1
+
+        retry = json.loads(provider._handle_apply_pending({
+            "pending_ids": ["cleanup1"],
+        }))
+
+        assert retry["applied_count"] == 0
+        assert retry["failed_count"] == 1
+        assert retry["cleanup_failed_count"] == 0
+        assert retry["cleanup_failed"] == []
+        assert len(mutation_calls) == 1
+        assert not record_path.exists()
+        assert len(list(pending_dir.glob("*.claim"))) == 1
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
 def test_apply_pending_failed_claim_is_restored_for_another_provider(
     provider_module_name, monkeypatch, tmp_path
 ):
