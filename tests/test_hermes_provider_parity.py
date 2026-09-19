@@ -260,6 +260,79 @@ def test_staged_pending_response_keys_match_across_providers(
         [e["action"] for e in standalone["staged_actions"]] == ["remember", "forget"]
 
 
+def test_session_switch_without_key_preserves_configured_gateway_scope(
+    tmp_path, monkeypatch, provider_modules
+):
+    """A later callback omission must not replace the configured gateway scope."""
+    stub = types.ModuleType("hermes_constants")
+    setattr(stub, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setitem(sys.modules, "hermes_constants", stub)
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"initial-{name}",
+            hermes_home=str(tmp_path / name),
+            gateway_session_key="configured-gateway",
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+
+        provider.on_session_switch(f"rotated-{name}")
+        provider.on_memory_write("add", "project", f"direct write from {name}")
+        direct_scope = provider._beam.conn.execute(
+            "SELECT session_id FROM working_memory WHERE content = ?",
+            (f"direct write from {name}",),
+        ).fetchone()[0]
+
+        monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+        staged = json.loads(provider.handle_tool_call(
+            "mnemosyne_remember",
+            {"content": f"staged write from {name}", "scope": "session"},
+        ))
+        pending_id = staged.get("pending_id") or staged["staged"][0]["pending_id"]
+        record = json.loads(
+            (tmp_path / "pending" / "memory" / f"{pending_id}.json").read_text()
+        )
+
+        assert provider._session_id == "hermes_configured-gateway"
+        assert direct_scope == "hermes_configured-gateway"
+        assert record["session_scope"] == "hermes_configured-gateway"
+        provider._beam.conn.close()
+
+
+def test_session_switch_callback_can_replace_configured_gateway_scope(
+    tmp_path, monkeypatch, provider_modules
+):
+    """An explicit non-empty callback key remains the durable gateway scope."""
+    monkeypatch.setenv("MNEMOSYNE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MNEMOSYNE_HOST_LLM_ENABLED", "0")
+
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider()
+        provider.initialize(
+            f"initial-{name}",
+            hermes_home=str(tmp_path / name),
+            gateway_session_key="configured-gateway",
+            profile_isolation=False,
+            agent_context="primary",
+        )
+        assert provider._beam is not None
+
+        provider.on_session_switch(
+            f"rotated-{name}", gateway_session_key="replacement-gateway"
+        )
+        provider.on_session_switch(f"rotated-again-{name}")
+
+        assert provider._gateway_session_key == "replacement-gateway"
+        assert provider._session_id == "hermes_replacement-gateway"
+        assert provider._beam.session_id == "hermes_replacement-gateway"
+        provider._beam.conn.close()
+
+
 def test_provider_tool_sets_match(provider_modules):
     tool_sets = {name: set(_tool_schemas(module)) for name, module in provider_modules.items()}
 

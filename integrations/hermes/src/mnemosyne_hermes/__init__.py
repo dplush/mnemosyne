@@ -3887,9 +3887,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             return
 
         with self._ensure_beam_access_lock():
-            self._gateway_session_key = (
-                kwargs.get("gateway_session_key") or self._gateway_session_key
-            )
+            callback_gateway_key = kwargs.get("gateway_session_key") or ""
+            if callback_gateway_key:
+                self._gateway_session_key = callback_gateway_key
             retry_args = getattr(self, "_retry_init_args", None)
             if retry_args is not None:
                 _, retry_kwargs = retry_args

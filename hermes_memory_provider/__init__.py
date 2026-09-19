@@ -1499,6 +1499,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         from ._verbatim_compat import make_verbatim_ledger
         self._verbatim_ledger = make_verbatim_ledger()
         self._active_session_id = ""
+        self._gateway_session_key = ""
         # Serialize all Beam/SQLite access between the main thread and the
         # auto_sleep daemon thread.  Without this, concurrent connections to
         # the same WAL database can trigger a NULL-pointer SEGV in
@@ -2038,6 +2039,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._hermes_home = kwargs.get("hermes_home", "")
         self._agent_identity = kwargs.get("agent_identity", None) or ""
+        self._gateway_session_key = kwargs.get("gateway_session_key") or ""
 
         # Re-init rebinds the verbatim ledger: entries recorded under a
         # previous session must never leak their exclusion into the new one.
@@ -2077,7 +2079,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         # stay isolated per-thread while scope='global' memories still surface
         # everywhere.  Falls back to the Hermes agent session_id for CLI and
         # non-gateway use (no behavior change for those paths).
-        stable_scope = kwargs.get("gateway_session_key") or session_id
+        stable_scope = self._gateway_session_key or session_id
         self._session_id = f"hermes_{stable_scope}"
 
         try:
@@ -2672,7 +2674,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         previous = getattr(self, "_active_session_id", "") or ""
         self._active_session_id = str(new_session_id or "").strip()
         if self._active_session_id:
-            stable_scope = kwargs.get("gateway_session_key") or self._active_session_id
+            callback_gateway_key = kwargs.get("gateway_session_key") or ""
+            if callback_gateway_key:
+                self._gateway_session_key = callback_gateway_key
+            stable_scope = (
+                callback_gateway_key
+                or self._gateway_session_key
+                or self._active_session_id
+            )
             provider_session_id = f"hermes_{stable_scope}"
             with self._ensure_beam_access_lock():
                 previous_session_id = self._session_id
