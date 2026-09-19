@@ -45,7 +45,9 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -197,6 +199,21 @@ def _write_pending_record(pending_dir, pid, payload, **record_fields):
     path = pending_dir / f"{pid}.json"
     path.write_text(json.dumps(record))
     return path
+
+
+def _stub_replay_provider(module, remember):
+    """Build a provider instance with only the replay dependencies populated."""
+    provider = object.__new__(module.MnemosyneMemoryProvider)
+    provider._beam = types.SimpleNamespace(
+        session_id="hermes_concurrent",
+        channel_id="hermes_concurrent",
+        remember=remember,
+    )
+    provider._memory = None
+    provider._session_id = "hermes_concurrent"
+    provider._default_scope = "session"
+    provider._audit_event = lambda *args, **kwargs: None
+    return provider
 
 
 @contextmanager
@@ -501,6 +518,116 @@ def test_apply_pending_mixed_success_and_failure_is_independent(
             assert retry["failed_count"] == 0
             assert not bad_path.exists()
             assert sorted(row[1] for row in _wm_rows(db_path)) == ["bad", "good"]
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_apply_pending_concurrent_providers_mutate_once(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+        record_path = _write_pending_record(
+            pending_dir,
+            "shared01",
+            {"action": "remember", "content": "single replay"},
+        )
+        replay_barrier = threading.Barrier(2)
+        count_lock = threading.Lock()
+        mutation_count = 0
+
+        def remember(**kwargs):
+            nonlocal mutation_count
+            try:
+                replay_barrier.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+            with count_lock:
+                mutation_count += 1
+                return f"memory-{mutation_count}"
+
+        providers = [
+            _stub_replay_provider(module, remember),
+            _stub_replay_provider(module, remember),
+        ]
+        start = threading.Barrier(2)
+
+        def apply(provider):
+            start.wait(timeout=1)
+            return json.loads(provider._handle_apply_pending({
+                "pending_ids": ["shared01"],
+            }))
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(apply, providers))
+
+        assert mutation_count == 1
+        assert sum(result["applied_count"] for result in results) == 1
+        assert sum(result["failed_count"] for result in results) == 1
+        assert not record_path.exists()
+        assert list(pending_dir.glob("*.claim")) == []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_apply_pending_failed_claim_is_restored_for_another_provider(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+        record_path = _write_pending_record(
+            pending_dir,
+            "retry001",
+            {"action": "remember", "content": "retry after failure"},
+        )
+
+        def fail(**kwargs):
+            raise RuntimeError("simulated replay failure")
+
+        failed = json.loads(_stub_replay_provider(
+            module, fail
+        )._handle_apply_pending({"pending_ids": ["retry001"]}))
+
+        assert failed["applied_count"] == 0
+        assert failed["failed_count"] == 1
+        assert record_path.exists()
+        assert list(pending_dir.glob("*.claim")) == []
+
+        applied = json.loads(_stub_replay_provider(
+            module, lambda **kwargs: "memory-retried"
+        )._handle_apply_pending({"pending_ids": ["retry001"]}))
+
+        assert applied["applied_count"] == 1
+        assert applied["failed_count"] == 0
+        assert not record_path.exists()
+        assert list(pending_dir.glob("*.claim")) == []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_apply_pending_malformed_record_is_restored(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        record_path = pending_dir / "broken01.json"
+        record_path.write_text("{not-json")
+
+        result = json.loads(_stub_replay_provider(
+            module, lambda **kwargs: "must-not-run"
+        )._handle_apply_pending({"pending_ids": ["broken01"]}))
+
+        assert result["applied_count"] == 0
+        assert result["failed_count"] == 1
+        assert record_path.read_text() == "{not-json"
+        assert list(pending_dir.glob("*.claim")) == []
 
 
 @pytest.mark.parametrize("provider_module_name", [

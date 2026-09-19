@@ -102,6 +102,28 @@ def _rollback_staged_writes(pending_ids: List[str]) -> None:
         (pending_dir / f"{pending_id}.json").unlink(missing_ok=True)
 
 
+def _claim_pending_record(record_path: Path) -> Optional[Path]:
+    """Atomically move a pending record into a private claim state."""
+    claim_path = record_path.with_name(
+        f".{record_path.name}.{uuid.uuid4().hex}.claim"
+    )
+    try:
+        record_path.rename(claim_path)
+    except FileNotFoundError:
+        return None
+    return claim_path
+
+
+def _restore_pending_claim(claim_path: Path, record_path: Path) -> None:
+    """Restore a failed claim without overwriting a newer pending record."""
+    os.link(claim_path, record_path)
+    try:
+        claim_path.unlink()
+    except Exception:
+        record_path.unlink(missing_ok=True)
+        raise
+
+
 from datetime import datetime, timedelta, timezone
 
 # Mnemosyne core is installed via pip (mnemosyne-memory>=3.11.1 dependency),
@@ -3232,11 +3254,17 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             if not rp.is_file():
                 failed.append({"id": pid, "error": "not found"})
                 continue
+
+            claim_path = _claim_pending_record(rp)
+            if claim_path is None:
+                failed.append({"id": pid, "error": "pending record already claimed"})
+                continue
             try:
-                record = json.loads(rp.read_text())
+                record = json.loads(claim_path.read_text())
                 # Verify the record's own id matches the filename
                 if record.get("id") != pid:
                     failed.append({"id": pid, "error": "id mismatch"})
+                    _restore_pending_claim(claim_path, rp)
                     continue
                 if (
                     record.get("subsystem") != "memory"
@@ -3246,6 +3274,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         "id": pid,
                         "error": "foreign pending record",
                     })
+                    _restore_pending_claim(claim_path, rp)
                     continue
                 p = record.get("payload", {})
                 # Scope binding (#936 review): the record belongs to the session
@@ -3289,12 +3318,14 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 ) as replay_beam:
                     if replay_beam is None:
                         failed.append({"id": pid, "error": "memory unavailable"})
+                        _restore_pending_claim(claim_path, rp)
                         continue
 
                     if action == "remember":
                         c = p.get("content", "")
                         if not c:
                             failed.append({"id": pid, "error": "empty content"})
+                            _restore_pending_claim(claim_path, rp)
                             continue
                         mid = replay_beam.remember(
                             content=c,
@@ -3313,7 +3344,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             source_tool="mnemosyne_apply_pending",
                             session_id=recorded_scope or current_scope,
                         )
-                        rp.unlink(missing_ok=True)
+                        claim_path.unlink(missing_ok=True)
                         entry = {"id": pid, "action": action, "memory_id": mid}
                         if session_redirected:
                             entry["session_redirected_from"] = current_scope
@@ -3327,6 +3358,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             "id": pid,
                             "error": f"memory_id is required for action {action}",
                         })
+                        _restore_pending_claim(claim_path, rp)
                         continue
 
                     replacement_id = p.get("replacement_id") or None
@@ -3349,6 +3381,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         )
                     else:
                         failed.append({"id": pid, "error": f"unknown action: {action}"})
+                        _restore_pending_claim(claim_path, rp)
                         continue
 
                     if not ok:
@@ -3356,6 +3389,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             "id": pid, "action": action,
                             "memory_id": memory_id, "error": "memory_not_found",
                         })
+                        _restore_pending_claim(claim_path, rp)
                         continue
                     # Audit parity with the direct handlers (#936 review): an
                     # approved destructive mutation is audited exactly like the
@@ -3387,13 +3421,21 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                 else {"invalidated": True}
                             ),
                         )
-                    rp.unlink(missing_ok=True)
+                    claim_path.unlink(missing_ok=True)
                     entry = {"id": pid, "action": action, "memory_id": memory_id}
                     if session_redirected:
                         entry["session_redirected_from"] = current_scope
                         entry["session_replayed_into"] = recorded_scope
                     applied.append(entry)
             except Exception as exc:
+                if claim_path.exists():
+                    try:
+                        _restore_pending_claim(claim_path, rp)
+                    except Exception as restore_exc:
+                        exc = RuntimeError(
+                            f"{exc}; pending claim retained as {claim_path.name}: "
+                            f"{restore_exc}"
+                        )
                 failed.append({"id": pid, "error": str(exc)})
         redirected = [a for a in applied if a.get("session_redirected_from")]
         return json.dumps({"applied": applied, "failed": failed,
