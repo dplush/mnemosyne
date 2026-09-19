@@ -220,7 +220,10 @@ queries and indexed documents. Mnemosyne exposes two environment-only settings:
 Both values are prepended verbatim, so preserve any trailing space required by
 the model. When they are unset or empty, Mnemosyne sends the original text
 unchanged. These variables are read directly from the environment and cannot be
-set in `config.yaml`.
+set in `config.yaml`. When `MNEMOSYNE_EMBEDDING_API_URL` is configured with a
+remote endpoint, prefixed text may be sent to that embedding API;
+privacy-sensitive deployments should remain local-first by using local
+embeddings or a locally hosted endpoint.
 
 For multilingual-E5:
 
