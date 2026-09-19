@@ -533,6 +533,33 @@ def test_stage_pending_retries_id_collision_without_overwriting(
     "hermes_memory_provider",
     "mnemosyne_hermes",
 ])
+def test_apply_pending_rejects_foreign_provider_record(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _make_provider(module) as (provider, db_path):
+        with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+            record_path = _write_pending_record(
+                pending_dir,
+                "foreign1",
+                {"action": "remember", "content": "must not store"},
+                provider="other-provider",
+            )
+            result = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["foreign1"],
+            }))
+
+            assert result["applied_count"] == 0
+            assert result["failed_count"] == 1
+            assert result["failed"][0]["error"] == "foreign pending record"
+            assert record_path.exists()
+            assert _wm_rows(db_path) == []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
 def test_background_review_batch_shape_failure_retains_pending_record(
     provider_module_name, monkeypatch, tmp_path
 ):

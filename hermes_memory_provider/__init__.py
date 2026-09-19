@@ -3669,6 +3669,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if record.get("id") != pid:
                     failed.append({"id": pid, "error": "id mismatch"})
                     continue
+                if (
+                    record.get("subsystem") != "memory"
+                    or record.get("provider") != "mnemosyne"
+                ):
+                    failed.append({
+                        "id": pid,
+                        "error": "foreign pending record",
+                    })
+                    continue
                 payload = record.get("payload", {})
 
                 # Session binding (#936 review): a staged record belongs to the

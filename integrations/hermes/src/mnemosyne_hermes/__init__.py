@@ -3234,6 +3234,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if record.get("id") != pid:
                     failed.append({"id": pid, "error": "id mismatch"})
                     continue
+                if (
+                    record.get("subsystem") != "memory"
+                    or record.get("provider") != "mnemosyne"
+                ):
+                    failed.append({
+                        "id": pid,
+                        "error": "foreign pending record",
+                    })
+                    continue
                 p = record.get("payload", {})
                 # Scope binding (#936 review): the record belongs to the session
                 # it was staged from. on_session_switch() durably rebinds the
