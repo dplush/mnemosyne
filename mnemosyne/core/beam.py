@@ -1926,10 +1926,22 @@ class _BeamCursor(sqlite3.Cursor):
     """
 
     def execute(self, sql, *args, **kwargs):
+        conn = self.connection
+        track = getattr(conn, "_track_savepoint_statement", None)
+        release_check = getattr(conn, "_release_may_commit", None)
+        # Pre-state must be read before execution: after a RELEASE that
+        # implicitly commits, in_transaction is already False.
+        watching_release = bool(
+            track is not None
+            and release_check is not None
+            and release_check(sql)
+        )
         cursor = super().execute(sql, *args, **kwargs)
-        track = getattr(self.connection, "_track_savepoint_statement", None)
         if track is not None:
             track(sql)
+        if watching_release and not conn.in_transaction:
+            conn._savepoint_hook_marks.clear()
+            conn._drain_after_commit_hooks()
         return cursor
 
 

@@ -249,3 +249,19 @@ def test_outermost_savepoint_release_emits_on_implicit_commit(tmp_path: Path):
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
     ).fetchone()[0] == 0
+
+
+def test_cursor_outermost_savepoint_release_emits_on_implicit_commit(tmp_path: Path):
+    """A bare cursor SAVEPOINT + RELEASE commits: the event fires (#963)."""
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("cursor outer row", source="test")
+    cur = mem.conn.cursor()
+    cur.execute("SAVEPOINT caller")
+    assert mem.forget(mid) is True
+    assert events == []
+    cur.execute("RELEASE caller")
+
+    assert events == [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 0
