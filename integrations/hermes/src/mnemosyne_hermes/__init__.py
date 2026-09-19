@@ -58,11 +58,10 @@ def _stage_pending_write(payload: Dict[str, Any],
     the write in the wrong session (#936 review).
     """
     from hermes_constants import get_hermes_home
-    pid = uuid.uuid4().hex[:8]
     pending_dir = get_hermes_home() / "pending" / "memory"
     pending_dir.mkdir(parents=True, exist_ok=True)
     record = {
-        "id": pid, "subsystem": "memory", "provider": "mnemosyne",
+        "id": "", "subsystem": "memory", "provider": "mnemosyne",
         "tool": payload.get("tool", "mnemosyne_remember"),
         "payload": payload,
         # Non-content actions (update/forget/invalidate) may stage
@@ -77,13 +76,21 @@ def _stage_pending_write(payload: Dict[str, Any],
     if channel_scope:
         # Same reasoning; a Beam write's channel is not always its session.
         record["channel_scope"] = channel_scope
-    record_path = pending_dir / f"{pid}.json"
-    try:
-        record_path.write_text(json.dumps(record, indent=2))
-    except Exception:
-        record_path.unlink(missing_ok=True)
-        raise
-    return pid
+    for _ in range(10):
+        pid = uuid.uuid4().hex[:8]
+        record["id"] = pid
+        record_path = pending_dir / f"{pid}.json"
+        try:
+            with record_path.open("x") as handle:
+                json.dump(record, handle, indent=2)
+        except FileExistsError:
+            continue
+        except Exception:
+            # Cleanup is safe here because exclusive creation succeeded.
+            record_path.unlink(missing_ok=True)
+            raise
+        return pid
+    raise RuntimeError("could not allocate a unique pending record id")
 
 
 def _rollback_staged_writes(pending_ids: List[str]) -> None:

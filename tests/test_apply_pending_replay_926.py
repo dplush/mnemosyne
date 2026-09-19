@@ -507,6 +507,32 @@ def test_apply_pending_mixed_success_and_failure_is_independent(
     "hermes_memory_provider",
     "mnemosyne_hermes",
 ])
+def test_stage_pending_retries_id_collision_without_overwriting(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        existing = pending_dir / "deadbeef.json"
+        existing.write_text("sentinel")
+
+        class _FakeUUID:
+            def __init__(self, value):
+                self.hex = value
+
+        ids = iter([_FakeUUID("deadbeef" * 4), _FakeUUID("cafebabe" * 4)])
+        monkeypatch.setattr(module.uuid, "uuid4", lambda: next(ids))
+        pid = module._stage_pending_write({"content": "new record"})
+
+        assert pid == "cafebabe"
+        assert existing.read_text() == "sentinel"
+        assert json.loads((pending_dir / f"{pid}.json").read_text())["id"] == pid
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
 def test_background_review_batch_shape_failure_retains_pending_record(
     provider_module_name, monkeypatch, tmp_path
 ):
