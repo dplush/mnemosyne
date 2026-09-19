@@ -1916,6 +1916,23 @@ _SAVEPOINT_STMT_RE = re.compile(
 )
 
 
+class _BeamCursor(sqlite3.Cursor):
+    """Cursor that mirrors savepoint scope for after-commit hooks.
+
+    Same tracker as _BeamConnection.execute(): without it a savepoint
+    rolled back through a cursor would undo a hook's data while the
+    hook stays queued and fires a phantom event on the next commit
+    (see #963). Bookkeeping runs only after the statement succeeds.
+    """
+
+    def execute(self, sql, *args, **kwargs):
+        cursor = super().execute(sql, *args, **kwargs)
+        track = getattr(self.connection, "_track_savepoint_statement", None)
+        if track is not None:
+            track(sql)
+        return cursor
+
+
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
 
@@ -1983,6 +2000,15 @@ class _BeamConnection(sqlite3.Connection):
         self._savepoint_hook_marks.clear()
         super().rollback()
 
+    def cursor(self, factory=None):
+        """Return a hook-aware cursor (see _BeamCursor).
+
+        An explicit factory is honored; the default cursor mirrors
+        savepoint scope for after-commit hooks exactly like
+        connection-level execute().
+        """
+        return super().cursor(factory or _BeamCursor)
+
     def execute(self, sql, *args, **kwargs):
         """Execute SQL, mirroring savepoint scope for after-commit hooks.
 
@@ -1992,18 +2018,35 @@ class _BeamConnection(sqlite3.Connection):
         phantom event on the next commit (see #963). Bookkeeping runs
         only after the statement succeeds: a failed statement changes
         neither SQLite state nor our mirror of it.
+
+        Releasing the outermost savepoint implicitly commits (SQLite
+        starts a transaction for a bare SAVEPOINT), so when a RELEASE
+        flips the connection from in-transaction to autocommit the
+        queued hooks describe durable data and are drained — unless
+        commit deferral is active, in which case the deferred
+        finalization drains them.
         """
+        release_may_commit = self._release_may_commit(sql)
         cursor = super().execute(sql, *args, **kwargs)
         self._track_savepoint_statement(sql)
+        if release_may_commit and not self.in_transaction:
+            self._savepoint_hook_marks.clear()
+            self._drain_after_commit_hooks()
         return cursor
+
+    def _release_may_commit(self, sql) -> bool:
+        """True when this RELEASE could implicitly commit (see #963)."""
+        if self._defer_commit or not self.in_transaction or not isinstance(sql, str):
+            return False
+        match = _SAVEPOINT_STMT_RE.match(sql)
+        return match is not None and match.group("verb").upper() == "RELEASE"
 
     def _track_savepoint_statement(self, sql) -> None:
         """Mirror one savepoint statement onto the hook-queue marks.
 
-        Only statements issued through this connection's execute() are
-        visible here: savepoints managed through a cursor bypass the
-        mirror. Core cursor-issued savepoints never span hook
-        registration, and an untracked name is left alone rather than
+        Reached from both connection-level execute() and _BeamCursor.
+        Anything bypassing both (e.g. a foreign cursor factory) is
+        invisible here: an untracked name is left alone rather than
         guessed at (dropping outer hooks would silently lose real
         events). Duplicate names resolve innermost-first.
         """

@@ -216,3 +216,36 @@ def test_released_savepoint_keeps_queued_event(tmp_path: Path):
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
     ).fetchone()[0] == 0
+
+
+def test_cursor_savepoint_rollback_discards_queued_event(tmp_path: Path):
+    """A cursor-level ROLLBACK TO discards the hook like any other (#963)."""
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("cursor row", source="test")
+    cur = mem.conn.cursor()
+    mem.conn.execute("BEGIN")
+    cur.execute("SAVEPOINT caller")
+    assert mem.forget(mid) is True
+    cur.execute("ROLLBACK TO caller")
+    cur.execute("RELEASE caller")
+    mem.conn.commit()
+
+    assert events == []
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 1
+
+
+def test_outermost_savepoint_release_emits_on_implicit_commit(tmp_path: Path):
+    """RELEASE of a bare SAVEPOINT commits: the event fires at once (#963)."""
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("outer row", source="test")
+    mem.conn.execute("SAVEPOINT caller")
+    assert mem.forget(mid) is True
+    assert events == []
+    mem.conn.execute("RELEASE caller")
+
+    assert events == [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 0
