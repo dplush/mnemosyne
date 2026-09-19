@@ -460,6 +460,36 @@ def test_redirected_remember_reports_scope_metadata(
             assert applied["session_redirected_count"] == 1
 
 
+@pytest.mark.parametrize("provider_module_name", ["mnemosyne_hermes"])
+def test_explicit_channel_equal_to_session_is_not_rebound(
+    provider_module_name, monkeypatch, tmp_path
+):
+    """An explicitly pinned channel must survive legacy replay unchanged."""
+    module = _import_provider(provider_module_name)
+    with _pending_home(monkeypatch, tmp_path) as pending_dir:
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        pid = "legacy01"
+        (pending_dir / f"{pid}.json").write_text(json.dumps({
+            "id": pid,
+            "subsystem": "memory",
+            "provider": "mnemosyne",
+            "payload": {"action": "remember", "content": "pinned channel"},
+            "session_scope": "hermes_sess-a",
+        }))
+
+        with _provider(
+            module, tmp_path, "sess-b", channel_id="hermes_sess-b"
+        ) as prov_b:
+            applied = json.loads(prov_b.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": [pid]}
+            ))
+            assert applied["applied_count"] == 1, applied
+            rows = _wm_rows(_db_path(prov_b))
+            row = next(r for r in rows if r[1] == "pinned channel")
+            assert row[2] == "hermes_sess-a"
+            assert row[3] == "hermes_sess-b"
+
+
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
 def test_same_session_replay_is_not_reported_as_redirected(
     provider_module_name, monkeypatch, tmp_path

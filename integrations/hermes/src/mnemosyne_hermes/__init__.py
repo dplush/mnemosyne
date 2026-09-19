@@ -1969,7 +1969,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             had_memory_channel = memory is not None and hasattr(memory, "channel_id")
 
             effective_channel = str(channel_scope or "")
-            if not effective_channel and beam_channel is not None and beam_channel == beam_session:
+            if (
+                not effective_channel
+                and not getattr(self, "_channel_id_explicit", False)
+                and beam_channel is not None
+            ):
                 # The channel was tracking the session (BeamMemory's default),
                 # so it has to track the recorded session as well. An explicitly
                 # pinned channel is only rebound from the record itself.
