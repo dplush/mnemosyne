@@ -299,6 +299,16 @@ def test_redirected_update_targets_the_staging_session(
             assert entry["session_redirected_from"] == "hermes_sess-b"
             assert applied["session_redirected_count"] == 1
 
+            updates = [
+                event for event in _audit_events(prov_b)
+                if event["action"] == "update"
+                and event["source_tool"] == "mnemosyne_apply_pending"
+            ]
+            assert len(updates) == 1
+            assert updates[0]["memory_id"] == seed_id
+            assert updates[0]["bank"] == "private"
+            assert updates[0]["session_id"] == "hermes_sess-a"
+
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
 def test_redirected_replay_failure_restores_live_scope_and_keeps_pending(
@@ -658,6 +668,49 @@ def test_staged_batch_response_keys_match_across_surfaces(monkeypatch, tmp_path)
 def _audit_events(prov):
     assert prov._audit is not None, "audit log must initialize with the beam"
     return prov._audit.query(limit=50)
+
+
+@pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
+def test_direct_and_replayed_update_audit_parity(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _pending_home(monkeypatch, tmp_path):
+        with _provider(module, tmp_path, "sess-a") as prov:
+            direct_target = json.loads(prov.handle_tool_call(
+                "mnemosyne_remember", {"content": "direct audit update target"}
+            ))["memory_id"]
+            replay_target = json.loads(prov.handle_tool_call(
+                "mnemosyne_remember", {"content": "replay audit update target"}
+            ))["memory_id"]
+
+            direct = json.loads(prov.handle_tool_call("mnemosyne_update", {
+                "memory_id": direct_target,
+                "content": "direct audited update",
+            }))
+            assert direct["status"] == "updated", direct
+
+            _force_approval_gate(module, monkeypatch)
+            pids = _stage_ops_in_session_a(prov, [{
+                "action": "update",
+                "memory_id": replay_target,
+                "content": "replayed audited update",
+            }])
+            applied = json.loads(prov.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": pids}
+            ))
+            assert applied["applied_count"] == 1, applied
+            events = _audit_events(prov)
+
+    updates = [event for event in events if event["action"] == "update"]
+    assert len(updates) == 2, events
+    by_source = {event["source_tool"]: event for event in updates}
+    assert set(by_source) == {"mnemosyne_update", "mnemosyne_apply_pending"}
+    assert by_source["mnemosyne_update"]["memory_id"] == direct_target
+    assert by_source["mnemosyne_apply_pending"]["memory_id"] == replay_target
+    for event in updates:
+        assert event["bank"] == "private"
+        assert event["session_id"] == "hermes_sess-a"
 
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)

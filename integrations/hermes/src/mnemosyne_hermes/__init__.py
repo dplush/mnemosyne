@@ -3532,6 +3532,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         content = args.get("content")
         importance = args.get("importance")
         ok = self._beam.update_working(memory_id, content=content, importance=importance)
+        if ok:
+            self._audit_event(
+                "update", memory_id=memory_id, bank="private",
+                source_tool="mnemosyne_update",
+            )
         return json.dumps({
             "status": "updated" if ok else "not_found",
             "memory_id": memory_id,
