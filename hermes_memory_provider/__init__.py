@@ -89,6 +89,15 @@ def _stage_pending_write(payload: Dict[str, Any],
     return pid
 
 
+def _rollback_staged_writes(pending_ids: List[str]) -> None:
+    """Remove records created by a batch whose later staging step failed."""
+    from hermes_constants import get_hermes_home
+
+    pending_dir = get_hermes_home() / "pending" / "memory"
+    for pending_id in pending_ids:
+        (pending_dir / f"{pending_id}.json").unlink(missing_ok=True)
+
+
 def _guard_selected_site_packages_python_compatibility(selected_site_packages: Path) -> None:
     """Reject a selected virtualenv that targets another Python minor version."""
     selected_site_packages = selected_site_packages.resolve()
@@ -2615,10 +2624,26 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         both the previous and the new session key so stale verbatim entries
         never suppress recall after the host rewinds.
         """
-        del parent_session_id, kwargs
+        del parent_session_id
         ledger = getattr(self, "_verbatim_ledger", None)
         previous = getattr(self, "_active_session_id", "") or ""
         self._active_session_id = str(new_session_id or "").strip()
+        if self._active_session_id:
+            stable_scope = kwargs.get("gateway_session_key") or self._active_session_id
+            provider_session_id = f"hermes_{stable_scope}"
+            with self._ensure_beam_access_lock():
+                previous_session_id = self._session_id
+                beam = self._beam
+                if beam is not None:
+                    beam.session_id = provider_session_id
+                    if getattr(beam, "channel_id", None) == previous_session_id:
+                        beam.channel_id = provider_session_id
+                memory = getattr(self, "_memory", None)
+                if memory is not None:
+                    memory.session_id = provider_session_id
+                    if getattr(memory, "channel_id", None) == previous_session_id:
+                        memory.channel_id = provider_session_id
+                self._session_id = provider_session_id
         if ledger is None or not ledger.enabled:
             return
         if reset or rewound:
@@ -2957,23 +2982,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 else:
                     stage_content = payload.get("content")
                     stage_importance = payload.get("importance")
-                pid = _stage_pending_write({
-                    "tool": "mnemosyne_batch",
-                    "action": action,
-                    "index": op.get("index"),
-                    "content": stage_content,
-                    "importance": stage_importance,
-                    "source": payload.get("source", "user"),
-                    "scope": payload.get("scope", self._default_scope),
-                    "valid_until": payload.get("valid_until"),
-                    "extract_entities": payload.get("extract_entities", False),
-                    "extract": payload.get("extract", False),
-                    "metadata": payload.get("metadata"),
-                    "veracity": payload.get("veracity"),
-                    "memory_id": payload.get("memory_id"),
-                    "replacement_id": payload.get("replacement_id"),
-                }, session_scope=self._session_id,
-                   channel_scope=str(getattr(self._beam, "channel_id", "") or ""))
+                try:
+                    pid = _stage_pending_write({
+                        "tool": "mnemosyne_batch",
+                        "action": action,
+                        "index": op.get("index"),
+                        "content": stage_content,
+                        "importance": stage_importance,
+                        "source": payload.get("source", "user"),
+                        "scope": payload.get("scope", self._default_scope),
+                        "valid_until": payload.get("valid_until"),
+                        "extract_entities": payload.get("extract_entities", False),
+                        "extract": payload.get("extract", False),
+                        "metadata": payload.get("metadata"),
+                        "veracity": payload.get("veracity"),
+                        "memory_id": payload.get("memory_id"),
+                        "replacement_id": payload.get("replacement_id"),
+                    }, session_scope=self._session_id,
+                       channel_scope=str(getattr(self._beam, "channel_id", "") or ""))
+                except Exception:
+                    _rollback_staged_writes(staged)
+                    raise
                 # PR #926 finding 7: 'staged' carries RAW pending IDs
                 # (strings) so a client can forward response['staged']
                 # verbatim to mnemosyne_apply_pending; action metadata
@@ -3700,6 +3729,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                                 payload.get("veracity"), context="mnemosyne_apply_pending"
                             ),
                         )
+                        self._audit_event(
+                            "remember", memory_id=memory_id, bank="private",
+                            scope=payload.get("scope", self._default_scope),
+                            source_tool="mnemosyne_apply_pending",
+                            session_id=recorded_scope or current_scope,
+                        )
                         record_path.unlink(missing_ok=True)
                         _entry = {"id": pid, "action": action, "memory_id": memory_id}
                         if session_redirected:
@@ -3751,7 +3786,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                     # landed in, not the approving session it was replayed from
                     # (CodeRabbit review 5241469678); legacy records with no
                     # recorded scope fall back to the current session.
-                    if action == "forget":
+                    if action == "update":
+                        self._audit_event(
+                            "update", memory_id=memory_id, bank="private",
+                            source_tool="mnemosyne_apply_pending",
+                            session_id=recorded_scope or current_scope,
+                        )
+                    elif action == "forget":
                         self._audit_event(
                             "forget", memory_id=memory_id, bank="private",
                             source_tool="mnemosyne_apply_pending",

@@ -588,6 +588,61 @@ def _audit_events(prov):
 
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
+@pytest.mark.parametrize("action", ["remember", "update"])
+def test_replayed_remember_and_update_emit_audit_events(
+    provider_module_name, action, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _pending_home(monkeypatch, tmp_path):
+        with _provider(module, tmp_path, "sess-a") as prov:
+            operation = {"action": "remember", "content": "audited staged remember"}
+            if action == "update":
+                seed = json.loads(prov.handle_tool_call(
+                    "mnemosyne_remember", {"content": "audit update target"}
+                ))
+                operation = {
+                    "action": "update",
+                    "memory_id": seed["memory_id"],
+                    "content": "audited staged update",
+                }
+            _force_approval_gate(module, monkeypatch)
+            pids = _stage_ops_in_session_a(prov, [operation])
+            applied = json.loads(prov.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": pids}
+            ))
+            assert applied["applied_count"] == 1, applied
+            events = _audit_events(prov)
+
+    replay_events = [
+        event for event in events
+        if event["action"] == action
+        and event["source_tool"] == "mnemosyne_apply_pending"
+    ]
+    assert len(replay_events) == 1, events
+    assert replay_events[0]["session_id"] == "hermes_sess-a"
+
+
+def test_root_provider_session_switch_rebinds_before_staging(monkeypatch, tmp_path):
+    module = _import_provider("hermes_memory_provider")
+    with _pending_home(monkeypatch, tmp_path) as pending_dir:
+        with _provider(module, tmp_path, "sess-a") as prov:
+            old_session = prov._session_id
+            assert old_session == "hermes_sess-a"
+            prov.on_session_switch("sess-b")
+            assert prov._session_id == "hermes_sess-b"
+            assert prov._beam.session_id == "hermes_sess-b"
+            assert prov._beam.channel_id == "hermes_sess-b"
+
+            _force_approval_gate(module, monkeypatch)
+            pids = _stage_ops_in_session_a(prov, [
+                {"action": "remember", "content": "staged after switch"},
+            ])
+            record = _record(pending_dir, pids[0])
+            assert record["session_scope"] == "hermes_sess-b"
+            assert record["channel_scope"] == "hermes_sess-b"
+
+
+@pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
 def test_replayed_forget_emits_audit_event(
     provider_module_name, monkeypatch, tmp_path
 ):

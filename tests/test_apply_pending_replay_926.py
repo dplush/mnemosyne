@@ -182,6 +182,23 @@ def _record_payload(pending_dir, pid):
     return json.loads((pending_dir / f"{pid}.json").read_text())["payload"]
 
 
+def _write_pending_record(pending_dir, pid, payload, **record_fields):
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "id": pid,
+        "subsystem": "memory",
+        "provider": "mnemosyne",
+        "tool": "mnemosyne_batch",
+        "payload": payload,
+        "summary": "",
+        "created_at": 0,
+        **record_fields,
+    }
+    path = pending_dir / f"{pid}.json"
+    path.write_text(json.dumps(record))
+    return path
+
+
 @contextmanager
 def _approval_setup(monkeypatch, tmp_path):
     """Point the pending store at tmp_path for the duration of a test.
@@ -436,6 +453,125 @@ def test_apply_pending_record_deleted_only_after_success(provider_module_name, m
             assert applied["applied_count"] == 0
             assert applied["failed_count"] == 1
             assert rec.exists(), "record must survive a failed content-less replay"
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_background_review_batch_shape_failure_retains_pending_record(
+    provider_module_name, monkeypatch, tmp_path
+):
+    """Regression for #969's Hermes background-review approval record."""
+    module = _import_provider(provider_module_name)
+    with _make_provider(module) as (provider, db_path):
+        with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+            record_path = _write_pending_record(
+                pending_dir,
+                "deadbeef",
+                {
+                    "action": "batch",
+                    "target": "user",
+                    "operations": [
+                        {"action": "add", "content": "a perfectly good entry"},
+                    ],
+                },
+                action="batch",
+                origin="background_review",
+            )
+
+            result = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["deadbeef"],
+            }))
+
+            assert result["applied_count"] == 0
+            assert result["failed_count"] == 1
+            assert "memory_id is required for action batch" in result["failed"][0]["error"]
+            assert record_path.exists(), "#969: parse/replay failure must retain the record"
+            assert _wm_rows(db_path) == []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_legacy_pending_record_without_action_replays_as_remember(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _make_provider(module) as (provider, db_path):
+        with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+            record_path = _write_pending_record(
+                pending_dir, "legacy01", {"content": "legacy staged write"}
+            )
+            result = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["legacy01"],
+            }))
+
+            assert result["applied_count"] == 1
+            assert result["failed_count"] == 0
+            assert result["applied"][0]["action"] == "remember"
+            assert _wm_rows(db_path)[0][1] == "legacy staged write"
+            assert not record_path.exists()
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_unknown_pending_action_fails_and_retains_record(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _make_provider(module) as (provider, db_path):
+        with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+            record_path = _write_pending_record(
+                pending_dir,
+                "unknown1",
+                {"action": "obliterate", "memory_id": "00000000-dead-beef"},
+            )
+            result = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["unknown1"],
+            }))
+
+            assert result["applied_count"] == 0
+            assert result["failed_count"] == 1
+            assert result["failed"][0]["error"] == "unknown action: obliterate"
+            assert record_path.exists()
+            assert _wm_rows(db_path) == []
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
+def test_batch_staging_failure_rolls_back_prior_records(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _make_provider(module) as (provider, _db_path):
+        with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+            monkeypatch.setattr(module, "_write_approval_enabled", lambda: True)
+            real_stage = module._stage_pending_write
+            calls = 0
+
+            def fail_second_stage(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated second staging failure")
+                return real_stage(*args, **kwargs)
+
+            monkeypatch.setattr(module, "_stage_pending_write", fail_second_stage)
+            result = json.loads(provider.handle_tool_call("mnemosyne_batch", {
+                "operations": [
+                    {"action": "remember", "content": "first"},
+                    {"action": "remember", "content": "second"},
+                ],
+            }))
+
+            assert "simulated second staging failure" in result["error"]
+            assert not list(pending_dir.glob("*.json"))
 
 
 # ---------------------------------------------------------------------------
