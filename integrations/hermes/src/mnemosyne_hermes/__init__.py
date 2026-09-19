@@ -77,7 +77,12 @@ def _stage_pending_write(payload: Dict[str, Any],
     if channel_scope:
         # Same reasoning; a Beam write's channel is not always its session.
         record["channel_scope"] = channel_scope
-    (pending_dir / f"{pid}.json").write_text(json.dumps(record, indent=2))
+    record_path = pending_dir / f"{pid}.json"
+    try:
+        record_path.write_text(json.dumps(record, indent=2))
+    except Exception:
+        record_path.unlink(missing_ok=True)
+        raise
     return pid
 
 

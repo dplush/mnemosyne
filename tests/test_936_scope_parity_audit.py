@@ -301,6 +301,49 @@ def test_redirected_update_targets_the_staging_session(
 
 
 @pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
+def test_redirected_replay_failure_restores_live_scope_and_keeps_pending(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _pending_home(monkeypatch, tmp_path) as pending_dir:
+        with _provider(module, tmp_path, "sess-a") as prov_a:
+            seed = json.loads(prov_a.handle_tool_call(
+                "mnemosyne_remember", {"content": "update me", "scope": "session"}
+            ))
+            seed_id = seed["memory_id"]
+            _force_approval_gate(module, monkeypatch)
+            pids = _stage_ops_in_session_a(prov_a, [
+                {"action": "update", "memory_id": seed_id, "content": "updated by A"},
+            ])
+
+        with _provider(module, tmp_path, "sess-b") as prov_b:
+            before_session = prov_b._beam.session_id
+            before_channel = prov_b._beam.channel_id
+            real_update = prov_b._beam.update_working
+
+            def fail_update(*args, **kwargs):
+                raise RuntimeError("simulated redirected replay failure")
+
+            monkeypatch.setattr(prov_b._beam, "update_working", fail_update)
+            failed = json.loads(prov_b.handle_tool_call(
+                "mnemosyne_apply_pending", {"pending_ids": pids}
+            ))
+            assert failed["applied_count"] == 0, failed
+            assert failed["failed_count"] == 1, failed
+            assert (pending_dir / f"{pids[0]}.json").exists()
+            assert prov_b._beam.session_id == before_session
+            assert prov_b._beam.channel_id == before_channel
+
+            monkeypatch.setattr(prov_b._beam, "update_working", real_update)
+            monkeypatch.setattr(module, "_write_approval_enabled", lambda: False)
+            follow_up = json.loads(prov_b.handle_tool_call(
+                "mnemosyne_remember", {"content": "after failed replay"}
+            ))
+            assert follow_up["status"] == "stored"
+            assert _wm_rows(_db_path(prov_b))[-1][2] == before_session
+
+
+@pytest.mark.parametrize("provider_module_name", PROVIDER_MODULES)
 def test_redirected_forget_targets_the_staging_session(
     provider_module_name, monkeypatch, tmp_path
 ):

@@ -459,6 +459,54 @@ def test_apply_pending_record_deleted_only_after_success(provider_module_name, m
     "hermes_memory_provider",
     "mnemosyne_hermes",
 ])
+def test_apply_pending_mixed_success_and_failure_is_independent(
+    provider_module_name, monkeypatch, tmp_path
+):
+    module = _import_provider(provider_module_name)
+    with _make_provider(module) as (provider, db_path):
+        with _approval_setup(monkeypatch, tmp_path) as pending_dir:
+            good_path = _write_pending_record(
+                pending_dir, "good0001", {"action": "remember", "content": "good"}
+            )
+            bad_path = _write_pending_record(
+                pending_dir, "bad00001", {"action": "remember", "content": "bad"}
+            )
+            real_remember = provider._beam.remember
+            calls = 0
+
+            def fail_second(**kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("simulated replay failure")
+                return real_remember(**kwargs)
+
+            monkeypatch.setattr(provider._beam, "remember", fail_second)
+            result = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["good0001", "bad00001"],
+            }))
+
+            assert result["applied_count"] == 1
+            assert result["failed_count"] == 1
+            assert not good_path.exists()
+            assert bad_path.exists()
+            assert [row[1] for row in _wm_rows(db_path)] == ["good"]
+
+            # Retrying the failed record must not duplicate the successful one.
+            provider._beam.remember = real_remember
+            retry = json.loads(provider._handle_apply_pending({
+                "pending_ids": ["bad00001"],
+            }))
+            assert retry["applied_count"] == 1
+            assert retry["failed_count"] == 0
+            assert not bad_path.exists()
+            assert sorted(row[1] for row in _wm_rows(db_path)) == ["bad", "good"]
+
+
+@pytest.mark.parametrize("provider_module_name", [
+    "hermes_memory_provider",
+    "mnemosyne_hermes",
+])
 def test_background_review_batch_shape_failure_retains_pending_record(
     provider_module_name, monkeypatch, tmp_path
 ):
