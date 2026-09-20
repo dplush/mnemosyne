@@ -29,6 +29,7 @@ from mnemosyne.core.config import resolve_beam_runtime
 from mnemosyne.core.filters import _SYSTEM_DERIVED_WRITE_CAPABILITY
 from mnemosyne.core.journal import journal_mode
 from mnemosyne.core.recall_provenance import append_recall_provenance
+from mnemosyne.core.sqlite_config import configure_busy_timeout
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timedelta, timezone
@@ -1080,11 +1081,7 @@ def _get_connection(db_path: Path = None) -> sqlite3.Connection:
         # Configurable so deployments with long consolidation write windows
         # can let tool calls ride them out instead of failing with
         # "database is locked" after a hardcoded 5s.
-        try:
-            _busy_ms = int(os.environ.get("MNEMOSYNE_BUSY_TIMEOUT_MS", "5000"))
-        except ValueError:
-            _busy_ms = 5000
-        conn.execute(f"PRAGMA busy_timeout={_busy_ms}")
+        configure_busy_timeout(conn)
         conn.execute("PRAGMA foreign_keys=ON")
         if _SQLITE_VEC_AVAILABLE:
             try:

@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from mnemosyne.core.sqlite_config import configure_busy_timeout
+
 logger = logging.getLogger(__name__)
 
 _CREATE_TABLE = """
@@ -60,6 +62,7 @@ class AuditLog:
             self._conn = sqlite3.connect(
                 str(self._db_path), timeout=5, check_same_thread=False
             )
+            configure_busy_timeout(self._conn)
             self._conn.execute(_CREATE_TABLE)
             # Migration: add tokens_used column for existing databases
             try:
