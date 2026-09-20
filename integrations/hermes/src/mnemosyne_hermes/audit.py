@@ -10,15 +10,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from mnemosyne.core.sqlite_config import configure_busy_timeout
-
 logger = logging.getLogger(__name__)
+
+
+def _configure_busy_timeout(conn: sqlite3.Connection) -> None:
+    """Mirror core semantics without requiring a newer core package at import time."""
+    try:
+        timeout_ms = int(os.environ.get("MNEMOSYNE_BUSY_TIMEOUT_MS", "5000"))
+    except ValueError:
+        timeout_ms = 5000
+    conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS memory_audit_events (
@@ -63,7 +72,7 @@ class AuditLog:
             self._conn = sqlite3.connect(
                 str(self._db_path), timeout=5, check_same_thread=False
             )
-            configure_busy_timeout(self._conn)
+            _configure_busy_timeout(self._conn)
             self._conn.execute(_CREATE_TABLE)
             # Migration: add tokens_used column for existing databases
             try:
