@@ -69,7 +69,13 @@ _RUNTIME_ABSOLUTE_PATH = re.compile(
 _SAFE_MODEL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _SAFE_PACKAGE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,79}$")
 _SECRET_SHAPED_MODEL_IDENTIFIER = re.compile(
-    r"^(?:sk-|github_pat|gh[pousr]_|glpat-|xox[baprs]-|AIza)", re.IGNORECASE
+    r"(?:"
+    r"^(?:sk-|github_pat|gh[pousr]_|glpat-|xox[baprs]-|AIza)"
+    r"|^(?:pk|rk)-[A-Za-z0-9]{20,}$"
+    r"|(?:^|/)AKIA[0-9A-Z]{16}(?:$|/)"
+    r"|(?:^|/)eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:$|/)"
+    r")",
+    re.IGNORECASE,
 )
 _MODEL_FILE_SUFFIXES = {
     ".bin",
@@ -201,11 +207,13 @@ class DoctorReport:
     sqlite_health: dict[str, Any] = field(default_factory=dict)
     reference_contracts: dict[str, Any] = field(default_factory=dict)
     vector_coverage: dict[str, Any] = field(default_factory=dict)
-    embeddings: dict[str, Any] = field(default_factory=dict)
     hygiene_summary: dict[str, Any] = field(default_factory=dict)
     execution: dict[str, bool] = field(
         default_factory=lambda: {"read_only": True, "query_only": True, "dry_run": True}
     )
+    # Additive Doctor sections belong after the original positional fields so
+    # callers using the pre-embeddings constructor order remain compatible.
+    embeddings: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return plain JSON-compatible containers without executing any action."""
@@ -544,9 +552,13 @@ class RuntimeDiagnosticsAdapter:
 
             result = collect_runtime_diagnostics()
         except Exception:
-            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"})
+            return AdapterResult(
+                metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"}
+            )
         if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
-            return AdapterResult(metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"})
+            return AdapterResult(
+                metrics={"status": STATUS_UNKNOWN, "error_class": "runtime_error"}
+            )
         return AdapterResult(metrics=_sanitize_runtime_diagnostics(result))
 
 
@@ -555,12 +567,16 @@ def _safe_model_identifier(value: Any) -> str | None:
 
     if not isinstance(value, str) or not _SAFE_MODEL_IDENTIFIER.fullmatch(value):
         return None
-    if _SECRET_SHAPED_MODEL_IDENTIFIER.match(value):
+    if _SECRET_SHAPED_MODEL_IDENTIFIER.search(value):
         return None
     if value.startswith(("/", "\\", "./", "../", "~/")) or "//" in value:
         return None
     parts = value.split("/")
     if any(part in {".", ".."} for part in parts):
+        return None
+    # Public model registry identifiers use either a bare name or one
+    # namespace/name pair. Deeper slash-delimited values are relative paths.
+    if len(parts) > 2:
         return None
     if len(parts) > 1 and any(
         value.casefold().endswith(suffix) for suffix in _MODEL_FILE_SUFFIXES
@@ -913,6 +929,30 @@ def _sanitize_embeddings_status(
     fastembed_installed = source.get("fastembed_installed")
     configured_dimension = _nonnegative_int_or_none(source.get("configured_dimension"))
     observed_dimension = _nonnegative_int_or_none(source.get("observed_dimension"))
+    matching_model_vectors = persisted["matching_model_vectors"]
+    active = (
+        state == "active"
+        and source.get("activity_evidence") == "persisted_matching_vectors"
+        and configured is True
+        and backend == "fastembed_local"
+        and backend_available is True
+        and isinstance(matching_model_vectors, int)
+        and matching_model_vectors > 0
+        and persisted_status != STATUS_UNKNOWN
+    )
+    if state == "active" and not active:
+        if configured is False:
+            state = "disabled"
+        elif backend == "fastembed_local" and backend_available is False:
+            state = "unavailable"
+        elif (
+            backend == "fastembed_local"
+            and backend_available is True
+            and persisted_status not in {STATUS_UNKNOWN, "scan_limited"}
+        ):
+            state = "available"
+        else:
+            state = STATUS_UNKNOWN
     return {
         "state": state,
         "configured": configured if isinstance(configured, bool) else None,
@@ -929,12 +969,7 @@ def _sanitize_embeddings_status(
         "configured_dimension": configured_dimension if configured_dimension else None,
         "observed_dimension": observed_dimension if observed_dimension else None,
         "runtime_scope": "current_process",
-        "activity_evidence": (
-            "persisted_matching_vectors"
-            if state == "active"
-            and source.get("activity_evidence") == "persisted_matching_vectors"
-            else None
-        ),
+        "activity_evidence": "persisted_matching_vectors" if active else None,
         "pending_vectors": None,
         "failed_vectors": None,
         "model_revision": None,

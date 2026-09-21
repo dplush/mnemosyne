@@ -1,6 +1,7 @@
 """Focused contract tests for read-only Doctor embedding status (#1017)."""
 
 import builtins
+from dataclasses import fields
 import hashlib
 import json
 import sqlite3
@@ -358,10 +359,15 @@ def test_payload_redacts_untrusted_model_metadata_from_both_renderers(tmp_path):
 @pytest.mark.parametrize(
     "unsafe_model",
     [
-        "sk-doctor-private-token",
-        "github_pat_doctor_private_token",
+        "sk-" + "a" * 20,
+        "github_pat_" + "a" * 22,
+        "AKIA" + "A" * 16,
+        "pk-" + "a" * 20,
+        "rk-" + "a" * 20,
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkb2N0b3IifQ.signature",
         "../private/model",
         "org/../private-model",
+        "relative/private/model",
         "relative/private/model.onnx",
         "/absolute/private/model",
         "C:/absolute/private/model",
@@ -393,6 +399,8 @@ def test_payload_redacts_secret_and_path_shaped_model_metadata(unsafe_model, tmp
         "BAAI/bge-small-en-v1.5",
         "text-embedding-3-small",
         "nomic-ai/nomic-embed-text-v1.5",
+        "pk-embedding-model",
+        "rk-embedding-model",
     ],
 )
 def test_payload_preserves_ordinary_safe_model_identifiers(safe_model):
@@ -448,6 +456,83 @@ def test_embeddings_payload_is_additive_and_preserves_existing_report_keys():
         "dry_run": True,
     }
     assert payload["embeddings"]["runtime_scope"] == "current_process"
+
+
+def test_embeddings_field_preserves_original_doctor_report_positional_order():
+    original_fields = [
+        "bank_name",
+        "database_identity",
+        "findings",
+        "repair_candidates",
+        "schema_fingerprint",
+        "runtime_diagnostics",
+        "sqlite_health",
+        "reference_contracts",
+        "vector_coverage",
+        "hygiene_summary",
+        "execution",
+    ]
+    values = ["work", *({"position": index} for index in range(1, 11))]
+
+    report = DoctorReport(*values)
+
+    assert [item.name for item in fields(DoctorReport)] == [
+        *original_fields,
+        "embeddings",
+    ]
+    assert [getattr(report, name) for name in original_fields] == values
+    assert report.embeddings == {}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_state"),
+    [
+        ({"backend_available": False}, "unavailable"),
+        (
+            {
+                "coverage": {
+                    "persisted": {
+                        "status": "no_vectors",
+                        "total_vectors": 0,
+                        "scanned_vectors": 0,
+                        "matching_model_vectors": 0,
+                        "matching_dimension_vectors": 0,
+                        "scan_limited": False,
+                    }
+                }
+            },
+            "available",
+        ),
+    ],
+)
+def test_canonical_payload_downgrades_contradictory_active_claims(
+    overrides, expected_state
+):
+    claimed_active = EmbeddingsStatusAdapter(None, runtime=_runtime()).inspect().metrics
+    claimed_active.update(
+        {
+            "state": "active",
+            "activity_evidence": "persisted_matching_vectors",
+            "coverage": {
+                "persisted": {
+                    "status": "complete",
+                    "total_vectors": 1,
+                    "scanned_vectors": 1,
+                    "matching_model_vectors": 1,
+                    "matching_dimension_vectors": 1,
+                    "scan_limited": False,
+                }
+            },
+            **overrides,
+        }
+    )
+
+    payload = doctor_report_payload(
+        DoctorReport(bank_name="work", embeddings=claimed_active)
+    )
+
+    assert payload["embeddings"]["state"] == expected_state
+    assert payload["embeddings"]["activity_evidence"] is None
 
 
 def test_build_report_is_read_only_and_does_not_construct_or_call_embedding_routes(
