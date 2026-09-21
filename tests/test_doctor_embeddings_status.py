@@ -184,8 +184,37 @@ def test_matching_vector_beyond_bounded_sample_is_active_evidence(tmp_path):
     assert status["state"] == "active"
     assert status["activity_evidence"] == "persisted_matching_vectors"
     assert status["coverage"]["persisted"]["status"] == "scan_limited"
+    assert status["coverage"]["persisted"]["total_vectors"] is None
     assert status["coverage"]["persisted"]["scanned_vectors"] == scan_limit
     assert status["coverage"]["persisted"]["matching_model_vectors"] == 1
+    assert status["coverage"]["persisted"]["matching_dimension_vectors"] == 1
+
+
+@pytest.mark.parametrize("embedding_json", ["not-json", "[]"])
+def test_invalid_matching_sentinel_is_not_active_evidence(tmp_path, embedding_json):
+    scan_limit = 3
+    stale_rows = [
+        (f"stale-{index}", "[1, 2, 3]", "stale/model") for index in range(scan_limit)
+    ]
+    invalid_matching_row = (
+        "matching",
+        embedding_json,
+        "BAAI/bge-small-en-v1.5",
+    )
+
+    status = _inspect(
+        _embedding_db(tmp_path, [*stale_rows, invalid_matching_row]),
+        scan_limit=scan_limit,
+    )
+
+    persisted = status["coverage"]["persisted"]
+    assert status["state"] == "unknown"
+    assert status["activity_evidence"] is None
+    assert persisted["status"] == "scan_limited"
+    assert persisted["total_vectors"] is None
+    assert persisted["scanned_vectors"] == scan_limit
+    assert persisted["matching_model_vectors"] == 0
+    assert persisted["matching_dimension_vectors"] == 0
 
 
 def test_unknown_schema_metadata_does_not_invent_counts(tmp_path):

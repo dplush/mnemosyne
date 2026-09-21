@@ -680,11 +680,24 @@ class EmbeddingsStatusAdapter:
         raw_model = self.runtime.get("configured_model_raw")
         configured_dimension = self.runtime.get("configured_dimension")
         matching_model = sum(1 for row in rows if row[0] == raw_model)
-        if matching_model == 0 and overflow_row and overflow_row[0] == raw_model:
-            matching_model = 1
         matching_dimension = sum(
             1 for row in rows if row[0] == raw_model and row[1] == configured_dimension
         )
+        overflow_dimension = overflow_row[1] if overflow_row else None
+        overflow_has_vector = (
+            isinstance(overflow_dimension, int)
+            and not isinstance(overflow_dimension, bool)
+            and overflow_dimension > 0
+        )
+        if (
+            matching_model == 0
+            and overflow_row
+            and overflow_row[0] == raw_model
+            and overflow_has_vector
+        ):
+            matching_model = 1
+            if overflow_dimension == configured_dimension:
+                matching_dimension = 1
         metadata_known = all(
             isinstance(row[0], str)
             and isinstance(row[1], int)
