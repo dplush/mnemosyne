@@ -675,10 +675,13 @@ class EmbeddingsStatusAdapter:
             )
 
         truncated = len(rows) > self.scan_limit
+        overflow_row = rows[self.scan_limit] if truncated else None
         rows = rows[: self.scan_limit]
         raw_model = self.runtime.get("configured_model_raw")
         configured_dimension = self.runtime.get("configured_dimension")
         matching_model = sum(1 for row in rows if row[0] == raw_model)
+        if matching_model == 0 and overflow_row and overflow_row[0] == raw_model:
+            matching_model = 1
         matching_dimension = sum(
             1 for row in rows if row[0] == raw_model and row[1] == configured_dimension
         )
@@ -756,6 +759,8 @@ class EmbeddingsStatusAdapter:
             state = STATUS_UNKNOWN
         elif isinstance(matching, int) and matching > 0:
             state = "active"
+        elif persisted.get("status") == "scan_limited":
+            state = STATUS_UNKNOWN
         else:
             state = "available"
 
