@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -653,6 +654,23 @@ class EmbeddingsStatusAdapter:
             **extra,
         }
 
+    @staticmethod
+    def _embedding_dimension(embedding_json: Any) -> int | None:
+        """Return the dimension only for a non-empty, finite numeric JSON vector."""
+
+        try:
+            embedding = json.loads(embedding_json)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(embedding, list) or not embedding:
+            return None
+        if not all(
+            type(value) is int or (type(value) is float and math.isfinite(value))
+            for value in embedding
+        ):
+            return None
+        return len(embedding)
+
     def _persisted(self) -> tuple[dict[str, Any], str | None, int]:
         if self.conn is None:
             return (
@@ -696,9 +714,7 @@ class EmbeddingsStatusAdapter:
         try:
             rows = list(
                 self.conn.execute(
-                    "SELECT model, CASE WHEN json_valid(embedding_json) "
-                    "THEN json_array_length(embedding_json) ELSE NULL END "
-                    "FROM memory_embeddings LIMIT ?",
+                    "SELECT model, embedding_json FROM memory_embeddings LIMIT ?",
                     (self.scan_limit + 1,),
                 )
             )
@@ -711,6 +727,7 @@ class EmbeddingsStatusAdapter:
                 0,
             )
 
+        rows = [(row[0], self._embedding_dimension(row[1])) for row in rows]
         truncated = len(rows) > self.scan_limit
         overflow_row = rows[self.scan_limit] if truncated else None
         rows = rows[: self.scan_limit]

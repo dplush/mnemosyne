@@ -118,6 +118,28 @@ def test_matching_persisted_vector_is_active_operational_evidence(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "embedding_json",
+    [
+        "[0, -1, 2.5]",
+        "[1e-3, 2E2, -3.0]",
+    ],
+)
+def test_finite_numeric_scalar_vectors_remain_valid(tmp_path, embedding_json):
+    status = _inspect(
+        _embedding_db(
+            tmp_path,
+            [("memory-1", embedding_json, "BAAI/bge-small-en-v1.5")],
+        )
+    )
+
+    persisted = status["coverage"]["persisted"]
+    assert status["state"] == "active"
+    assert persisted["status"] == "complete"
+    assert persisted["matching_model_vectors"] == 1
+    assert persisted["matching_dimension_vectors"] == 1
+
+
+@pytest.mark.parametrize(
     ("rows", "scan_limit", "coverage_state", "state"),
     [
         (
@@ -191,7 +213,21 @@ def test_matching_vector_beyond_bounded_sample_is_active_evidence(tmp_path):
     assert status["coverage"]["persisted"]["matching_dimension_vectors"] == 1
 
 
-@pytest.mark.parametrize("embedding_json", ["not-json", "[]"])
+@pytest.mark.parametrize(
+    "embedding_json",
+    [
+        "not-json",
+        "[]",
+        '[1, 2, "3"]',
+        "[1, 2, null]",
+        "[1, 2, [3]]",
+        "[1, 2, true]",
+        "[1, 2, NaN]",
+        "[1, 2, Infinity]",
+        "[1, 2, -Infinity]",
+        "[1, 2, 1e999]",
+    ],
+)
 def test_invalid_matching_sentinel_is_not_active_evidence(tmp_path, embedding_json):
     scan_limit = 3
     stale_rows = [
@@ -218,7 +254,21 @@ def test_invalid_matching_sentinel_is_not_active_evidence(tmp_path, embedding_js
     assert persisted["matching_dimension_vectors"] == 0
 
 
-@pytest.mark.parametrize("embedding_json", ["not-json", "[]"])
+@pytest.mark.parametrize(
+    "embedding_json",
+    [
+        "not-json",
+        "[]",
+        '[1, 2, "3"]',
+        "[1, 2, null]",
+        "[1, 2, [3]]",
+        "[1, 2, false]",
+        "[1, 2, NaN]",
+        "[1, 2, Infinity]",
+        "[1, 2, -Infinity]",
+        "[1, 2, -1e999]",
+    ],
+)
 def test_invalid_matching_sample_is_not_active_evidence_under_truncation(
     tmp_path, embedding_json
 ):
