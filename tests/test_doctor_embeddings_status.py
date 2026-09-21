@@ -407,6 +407,57 @@ def test_payload_redacts_untrusted_model_metadata_from_both_renderers(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "unsafe_version",
+    [
+        "sk-" + "a" * 20,
+        "ghp_" + "a" * 20,
+        "xoxb-" + "a" * 20,
+        "../private/fastembed",
+        "/private/fastembed",
+        r"C:\\private\\fastembed",
+    ],
+)
+def test_payload_redacts_secret_and_path_shaped_fastembed_versions(unsafe_version):
+    report = DoctorReport(
+        bank_name="work",
+        embeddings={
+            **EmbeddingsStatusAdapter(None, runtime=_runtime()).inspect().metrics,
+            "fastembed_version": unsafe_version,
+        },
+    )
+
+    payload = doctor_report_payload(report)
+    json_text = render_doctor_json(payload)
+    human_text = render_doctor_markdown(payload)
+
+    assert payload["embeddings"]["fastembed_version"] is None
+    assert unsafe_version not in json_text
+    assert unsafe_version not in human_text
+
+
+@pytest.mark.parametrize(
+    "safe_version",
+    ["0.7.3", "1.2.3rc1", "2.0.0.post1", "3.1.0+cpu", "2026.09.dev2"],
+)
+def test_payload_preserves_ordinary_fastembed_versions(safe_version):
+    report = DoctorReport(
+        bank_name="work",
+        embeddings={
+            **EmbeddingsStatusAdapter(None, runtime=_runtime()).inspect().metrics,
+            "fastembed_version": safe_version,
+        },
+    )
+
+    payload = doctor_report_payload(report)
+    json_text = render_doctor_json(payload)
+    human_text = render_doctor_markdown(payload)
+
+    assert payload["embeddings"]["fastembed_version"] == safe_version
+    assert safe_version in json_text
+    assert safe_version in human_text
+
+
+@pytest.mark.parametrize(
     "unsafe_model",
     [
         "sk-" + "a" * 20,

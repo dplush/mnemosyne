@@ -586,6 +586,18 @@ def _safe_model_identifier(value: Any) -> str | None:
     return value
 
 
+def _safe_package_version(value: Any) -> str | None:
+    """Return a bounded package version, never a secret or path-like value."""
+
+    if not isinstance(value, str):
+        return None
+    if _SECRET_SHAPED_MODEL_IDENTIFIER.search(value):
+        return None
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        return None
+    return value if _SAFE_PACKAGE_VERSION.fullmatch(value) else None
+
+
 def _embedding_runtime_status() -> dict[str, Any]:
     """Inspect embedding configuration without constructing or probing a model."""
 
@@ -609,8 +621,7 @@ def _embedding_runtime_status() -> dict[str, Any]:
             version = importlib.metadata.version("fastembed")
         except importlib.metadata.PackageNotFoundError:
             version = None
-        if not isinstance(version, str) or not _SAFE_PACKAGE_VERSION.fullmatch(version):
-            version = None
+        version = _safe_package_version(version)
         return {
             "disabled": disabled,
             "backend": backend,
@@ -944,9 +955,7 @@ def _sanitize_embeddings_status(
     backend = source.get("backend")
     if backend not in {"fastembed_local", "openai_compatible_api"}:
         backend = None
-    version = source.get("fastembed_version")
-    if not isinstance(version, str) or not _SAFE_PACKAGE_VERSION.fullmatch(version):
-        version = None
+    version = _safe_package_version(source.get("fastembed_version"))
 
     raw_coverage = source.get("coverage")
     raw_coverage = raw_coverage if isinstance(raw_coverage, dict) else {}
