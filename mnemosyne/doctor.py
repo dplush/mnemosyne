@@ -995,8 +995,17 @@ def _sanitize_embeddings_status(
     observed_dimension = _nonnegative_int_or_none(source.get("observed_dimension"))
     matching_model_vectors = persisted["matching_model_vectors"]
     coverage_consistent = _persisted_coverage_is_consistent(persisted)
+    coverage_degraded = (
+        "error_class" in persisted or persisted.get("columns_truncated") is True
+    )
+    local_backend_inconsistent = (
+        backend == "fastembed_local"
+        and backend_available is True
+        and fastembed_installed is False
+    )
     coverage_supports_active = (
         coverage_consistent
+        and not coverage_degraded
         and persisted_status
         in {"complete", "partial", "scan_limited", "dimension_mismatch"}
         and isinstance(matching_model_vectors, int)
@@ -1008,6 +1017,7 @@ def _sanitize_embeddings_status(
         and configured is True
         and backend == "fastembed_local"
         and backend_available is True
+        and not local_backend_inconsistent
         and coverage_supports_active
     )
     if state == "active" and not active:
@@ -1015,7 +1025,7 @@ def _sanitize_embeddings_status(
             state = "disabled"
         elif backend == "fastembed_local" and backend_available is False:
             state = "unavailable"
-        elif not coverage_consistent:
+        elif not coverage_consistent or coverage_degraded or local_backend_inconsistent:
             state = STATUS_UNKNOWN
         elif (
             backend == "fastembed_local"

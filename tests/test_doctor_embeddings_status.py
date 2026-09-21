@@ -540,6 +540,14 @@ def test_embeddings_field_preserves_original_doctor_report_positional_order():
         ({"backend_available": False}, "unavailable"),
         (
             {
+                "backend": "fastembed_local",
+                "backend_available": True,
+                "fastembed_installed": False,
+            },
+            "unknown",
+        ),
+        (
+            {
                 "coverage": {
                     "persisted": {
                         "status": "no_vectors",
@@ -553,6 +561,45 @@ def test_embeddings_field_preserves_original_doctor_report_positional_order():
             },
             "available",
         ),
+        (
+            {
+                "coverage": {
+                    "persisted": {
+                        "status": "complete",
+                        "total_vectors": 1,
+                        "scanned_vectors": 1,
+                        "matching_model_vectors": 1,
+                        "matching_dimension_vectors": 1,
+                        "scan_limited": False,
+                        "error_class": "sqlite_error",
+                    }
+                }
+            },
+            "unknown",
+        ),
+        (
+            {
+                "coverage": {
+                    "persisted": {
+                        "status": "complete",
+                        "total_vectors": 1,
+                        "scanned_vectors": 1,
+                        "matching_model_vectors": 1,
+                        "matching_dimension_vectors": 1,
+                        "scan_limited": False,
+                        "columns_truncated": True,
+                    }
+                }
+            },
+            "unknown",
+        ),
+    ],
+    ids=[
+        "backend-unavailable",
+        "fastembed-installation-availability-conflict",
+        "no-vectors",
+        "persisted-error",
+        "persisted-columns-truncated",
     ],
 )
 def test_canonical_payload_downgrades_contradictory_active_claims(
