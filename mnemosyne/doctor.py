@@ -868,6 +868,53 @@ def _nonnegative_int_or_none(value: Any) -> int | None:
     )
 
 
+def _persisted_coverage_is_consistent(persisted: dict[str, Any]) -> bool:
+    """Validate relationships between a persisted coverage status and its counts."""
+
+    status = persisted["status"]
+    total = persisted["total_vectors"]
+    scanned = persisted["scanned_vectors"]
+    matching_model = persisted["matching_model_vectors"]
+    matching_dimension = persisted["matching_dimension_vectors"]
+    scan_limited = persisted["scan_limited"]
+
+    if status == STATUS_UNKNOWN:
+        return True
+    if status == "no_vectors":
+        return (
+            total == 0
+            and scanned == 0
+            and matching_model == 0
+            and matching_dimension == 0
+            and not scan_limited
+        )
+    if not all(
+        isinstance(value, int)
+        for value in (scanned, matching_model, matching_dimension)
+    ):
+        return False
+    if matching_dimension > matching_model:
+        return False
+    if status == "scan_limited":
+        return (
+            total is None
+            and scanned > 0
+            and matching_model <= scanned + 1
+            and scan_limited
+        )
+    if not isinstance(total, int) or total <= 0 or scanned != total or scan_limited:
+        return False
+    if status == "model_mismatch":
+        return matching_model == 0 and matching_dimension == 0
+    if status == "complete":
+        return matching_model == total and matching_dimension == matching_model
+    if status == "partial":
+        return 0 < matching_model < total
+    if status == "dimension_mismatch":
+        return matching_model == total and matching_dimension < matching_model
+    return False
+
+
 def _sanitize_embeddings_status(
     embeddings: Any, vector_coverage: Any
 ) -> dict[str, Any]:
@@ -930,21 +977,29 @@ def _sanitize_embeddings_status(
     configured_dimension = _nonnegative_int_or_none(source.get("configured_dimension"))
     observed_dimension = _nonnegative_int_or_none(source.get("observed_dimension"))
     matching_model_vectors = persisted["matching_model_vectors"]
+    coverage_consistent = _persisted_coverage_is_consistent(persisted)
+    coverage_supports_active = (
+        coverage_consistent
+        and persisted_status
+        in {"complete", "partial", "scan_limited", "dimension_mismatch"}
+        and isinstance(matching_model_vectors, int)
+        and matching_model_vectors > 0
+    )
     active = (
         state == "active"
         and source.get("activity_evidence") == "persisted_matching_vectors"
         and configured is True
         and backend == "fastembed_local"
         and backend_available is True
-        and isinstance(matching_model_vectors, int)
-        and matching_model_vectors > 0
-        and persisted_status != STATUS_UNKNOWN
+        and coverage_supports_active
     )
     if state == "active" and not active:
         if configured is False:
             state = "disabled"
         elif backend == "fastembed_local" and backend_available is False:
             state = "unavailable"
+        elif not coverage_consistent:
+            state = STATUS_UNKNOWN
         elif (
             backend == "fastembed_local"
             and backend_available is True

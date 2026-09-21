@@ -535,6 +535,62 @@ def test_canonical_payload_downgrades_contradictory_active_claims(
     assert payload["embeddings"]["activity_evidence"] is None
 
 
+@pytest.mark.parametrize(
+    "persisted",
+    [
+        {
+            "status": "no_vectors",
+            "total_vectors": 0,
+            "scanned_vectors": 0,
+            "matching_model_vectors": 1,
+            "matching_dimension_vectors": 1,
+            "scan_limited": False,
+        },
+        {
+            "status": "model_mismatch",
+            "total_vectors": 1,
+            "scanned_vectors": 1,
+            "matching_model_vectors": 1,
+            "matching_dimension_vectors": 1,
+            "scan_limited": False,
+        },
+        {
+            "status": "complete",
+            "total_vectors": 0,
+            "scanned_vectors": 1,
+            "matching_model_vectors": 1,
+            "matching_dimension_vectors": 1,
+            "scan_limited": False,
+        },
+        {
+            "status": "complete",
+            "total_vectors": 1,
+            "scanned_vectors": 0,
+            "matching_model_vectors": 1,
+            "matching_dimension_vectors": 1,
+            "scan_limited": False,
+        },
+    ],
+    ids=["no-vectors", "model-mismatch", "zero-total", "zero-scanned"],
+)
+def test_canonical_payload_rejects_impossible_positive_matching_coverage(persisted):
+    claimed_active = EmbeddingsStatusAdapter(None, runtime=_runtime()).inspect().metrics
+    claimed_active.update(
+        {
+            "state": "active",
+            "activity_evidence": "persisted_matching_vectors",
+            "coverage": {"persisted": persisted},
+        }
+    )
+
+    payload = doctor_report_payload(
+        DoctorReport(bank_name="work", embeddings=claimed_active)
+    )
+
+    assert payload["embeddings"]["state"] == "unknown"
+    assert payload["embeddings"]["activity_evidence"] is None
+
+
 def test_build_report_is_read_only_and_does_not_construct_or_call_embedding_routes(
     tmp_path, monkeypatch
 ):
