@@ -1569,7 +1569,6 @@ def _degradation_notes(payload: dict[str, Any]) -> list[str]:
         "sqlite_health",
         "reference_contracts",
         "vector_coverage",
-        "embeddings",
         "hygiene_summary",
     ):
         value = payload.get(section)
@@ -1578,8 +1577,25 @@ def _degradation_notes(payload: dict[str, Any]) -> list[str]:
         for name in sorted(value):
             metric = value[name]
             status = metric.get("status") if isinstance(metric, dict) else None
-            if status in {STATUS_UNKNOWN, "unavailable", STATUS_PRESENT_BUT_UNLOADABLE, "scan_limited"}:
+            if status in {
+                STATUS_UNKNOWN,
+                "unavailable",
+                STATUS_PRESENT_BUT_UNLOADABLE,
+                "scan_limited",
+            }:
                 notes.append(f"{section}.{name}: `{status}`")
+    embeddings = payload.get("embeddings")
+    if isinstance(embeddings, dict):
+        state = embeddings.get("state")
+        if state in {STATUS_UNKNOWN, "unavailable"}:
+            notes.append(f"embeddings.state: `{state}`")
+        coverage = embeddings.get("coverage")
+        persisted = coverage.get("persisted") if isinstance(coverage, dict) else None
+        persisted_status = (
+            persisted.get("status") if isinstance(persisted, dict) else None
+        )
+        if persisted_status in {STATUS_UNKNOWN, "scan_limited"}:
+            notes.append(f"embeddings.coverage.persisted: `{persisted_status}`")
     return notes
 
 

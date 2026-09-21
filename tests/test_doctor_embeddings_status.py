@@ -334,6 +334,66 @@ def test_unknown_schema_metadata_does_not_invent_counts(tmp_path):
     assert persisted["matching_dimension_vectors"] is None
 
 
+def test_unrelated_only_database_reports_no_persisted_vectors(tmp_path):
+    path = tmp_path / "unrelated.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE unrelated (id TEXT PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+    status = _inspect(path)
+
+    assert status["coverage"]["persisted"] == {
+        "status": "no_vectors",
+        "total_vectors": 0,
+        "scanned_vectors": 0,
+        "matching_model_vectors": 0,
+        "matching_dimension_vectors": 0,
+        "scan_limited": False,
+    }
+
+
+@pytest.mark.parametrize("denied_stage", ["catalog", "columns", "persisted"])
+def test_sqlite_authorizer_errors_propagate_to_persisted_coverage(
+    tmp_path, denied_stage
+):
+    path = _embedding_db(
+        tmp_path,
+        [("memory-1", "[0.1, 0.2, 0.3]", "BAAI/bge-small-en-v1.5")],
+    )
+    conn = open_readonly_doctor_db(path)
+
+    def authorize(action, arg1, _arg2, _database, _source):
+        denied = (
+            (
+                denied_stage == "catalog"
+                and action == sqlite3.SQLITE_READ
+                and arg1 == "sqlite_master"
+            )
+            or (
+                denied_stage == "columns"
+                and action == sqlite3.SQLITE_PRAGMA
+                and arg1 == "table_xinfo"
+            )
+            or (
+                denied_stage == "persisted"
+                and action == sqlite3.SQLITE_READ
+                and arg1 == "memory_embeddings"
+            )
+        )
+        return sqlite3.SQLITE_DENY if denied else sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorize)
+    try:
+        status = EmbeddingsStatusAdapter(conn, runtime=_runtime()).inspect().metrics
+    finally:
+        conn.close()
+
+    assert status["state"] == "unknown"
+    assert status["coverage"]["persisted"]["status"] == "unknown"
+    assert status["coverage"]["persisted"]["error_class"] == "database_error"
+
+
 def test_api_route_is_distinct_and_not_probed(tmp_path):
     status = _inspect(
         _embedding_db(tmp_path),
@@ -542,6 +602,27 @@ def test_json_and_human_output_render_same_canonical_embeddings_payload(tmp_path
             value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         assert f"- {key}: `{compact}`" in human
+
+
+@pytest.mark.parametrize("state", ["unknown", "unavailable"])
+@pytest.mark.parametrize("persisted_status", ["unknown", "scan_limited"])
+def test_degradation_notes_include_embedding_state_and_persisted_coverage(
+    state, persisted_status
+):
+    payload = {
+        "embeddings": {
+            "state": state,
+            "coverage": {
+                "working": {"status": "unknown"},
+                "persisted": {"status": persisted_status},
+            },
+        }
+    }
+
+    assert doctor._degradation_notes(payload) == [
+        f"embeddings.state: `{state}`",
+        f"embeddings.coverage.persisted: `{persisted_status}`",
+    ]
 
 
 def test_embeddings_payload_is_additive_and_preserves_existing_report_keys():
@@ -766,6 +847,11 @@ def test_build_report_is_read_only_and_does_not_construct_or_call_embedding_rout
     report = build_doctor_report("work", path)
 
     assert report.execution == {"read_only": True, "query_only": True, "dry_run": True}
+    assert set(report.embeddings["coverage"]) == {"persisted", "working", "episodic"}
+    assert report.embeddings["coverage"]["working"] == report.vector_coverage["working"]
+    assert (
+        report.embeddings["coverage"]["episodic"] == report.vector_coverage["episodic"]
+    )
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before_digest
     assert sorted(item.name for item in tmp_path.iterdir()) == before_files
     assert not Path(f"{path}-wal").exists()
