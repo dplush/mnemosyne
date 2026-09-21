@@ -172,8 +172,7 @@ def test_persisted_coverage_states(tmp_path, rows, scan_limit, coverage_state, s
 def test_matching_vector_beyond_bounded_sample_is_active_evidence(tmp_path):
     scan_limit = 3
     stale_rows = [
-        (f"stale-{index}", "[1, 2, 3]", "stale/model")
-        for index in range(scan_limit)
+        (f"stale-{index}", "[1, 2, 3]", "stale/model") for index in range(scan_limit)
     ]
     matching_row = ("matching", "[1, 2, 3]", "BAAI/bge-small-en-v1.5")
 
