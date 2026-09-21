@@ -68,6 +68,18 @@ _RUNTIME_ABSOLUTE_PATH = re.compile(
 )
 _SAFE_MODEL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _SAFE_PACKAGE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,79}$")
+_SECRET_SHAPED_MODEL_IDENTIFIER = re.compile(
+    r"^(?:sk-|github_pat|gh[pousr]_|glpat-|xox[baprs]-|AIza)", re.IGNORECASE
+)
+_MODEL_FILE_SUFFIXES = {
+    ".bin",
+    ".ckpt",
+    ".gguf",
+    ".onnx",
+    ".pt",
+    ".pth",
+    ".safetensors",
+}
 
 
 class _SQLiteVecExtensionDisableError(RuntimeError):
@@ -543,7 +555,16 @@ def _safe_model_identifier(value: Any) -> str | None:
 
     if not isinstance(value, str) or not _SAFE_MODEL_IDENTIFIER.fullmatch(value):
         return None
-    if value.startswith(("/", "\\")) or "//" in value:
+    if _SECRET_SHAPED_MODEL_IDENTIFIER.match(value):
+        return None
+    if value.startswith(("/", "\\", "./", "../", "~/")) or "//" in value:
+        return None
+    parts = value.split("/")
+    if any(part in {".", ".."} for part in parts):
+        return None
+    if len(parts) > 1 and any(
+        value.casefold().endswith(suffix) for suffix in _MODEL_FILE_SUFFIXES
+    ):
         return None
     return value
 
@@ -679,9 +700,24 @@ class EmbeddingsStatusAdapter:
         rows = rows[: self.scan_limit]
         raw_model = self.runtime.get("configured_model_raw")
         configured_dimension = self.runtime.get("configured_dimension")
-        matching_model = sum(1 for row in rows if row[0] == raw_model)
+        matching_model = sum(
+            1
+            for row in rows
+            if isinstance(raw_model, str)
+            and row[0] == raw_model
+            and isinstance(row[1], int)
+            and not isinstance(row[1], bool)
+            and row[1] > 0
+        )
         matching_dimension = sum(
-            1 for row in rows if row[0] == raw_model and row[1] == configured_dimension
+            1
+            for row in rows
+            if isinstance(raw_model, str)
+            and row[0] == raw_model
+            and isinstance(row[1], int)
+            and not isinstance(row[1], bool)
+            and row[1] > 0
+            and row[1] == configured_dimension
         )
         overflow_dimension = overflow_row[1] if overflow_row else None
         overflow_has_vector = (
@@ -690,14 +726,14 @@ class EmbeddingsStatusAdapter:
             and overflow_dimension > 0
         )
         if (
-            matching_model == 0
-            and overflow_row
+            overflow_row
+            and isinstance(raw_model, str)
             and overflow_row[0] == raw_model
             and overflow_has_vector
         ):
-            matching_model = 1
+            matching_model += 1
             if overflow_dimension == configured_dimension:
-                matching_dimension = 1
+                matching_dimension += 1
         metadata_known = all(
             isinstance(row[0], str)
             and isinstance(row[1], int)

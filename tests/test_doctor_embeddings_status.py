@@ -217,6 +217,56 @@ def test_invalid_matching_sentinel_is_not_active_evidence(tmp_path, embedding_js
     assert persisted["matching_dimension_vectors"] == 0
 
 
+@pytest.mark.parametrize("embedding_json", ["not-json", "[]"])
+def test_invalid_matching_sample_is_not_active_evidence_under_truncation(
+    tmp_path, embedding_json
+):
+    scan_limit = 3
+    rows = [
+        ("invalid-match", embedding_json, "BAAI/bge-small-en-v1.5"),
+        ("stale-one", "[1, 2, 3]", "stale/model"),
+        ("stale-two", "[1, 2, 3]", "stale/model"),
+        ("overflow", "[1, 2, 3]", "another/model"),
+    ]
+
+    status = _inspect(_embedding_db(tmp_path, rows), scan_limit=scan_limit)
+
+    persisted = status["coverage"]["persisted"]
+    assert status["state"] == "unknown"
+    assert status["activity_evidence"] is None
+    assert persisted["status"] == "scan_limited"
+    assert persisted["total_vectors"] is None
+    assert persisted["scanned_vectors"] == scan_limit
+    assert persisted["matching_model_vectors"] == 0
+    assert persisted["matching_dimension_vectors"] == 0
+
+
+@pytest.mark.parametrize("first_embedding", ["[1, 2]", "not-json", "[]"])
+def test_valid_matching_sentinel_is_counted_after_nonmatching_sample_evidence(
+    tmp_path, first_embedding
+):
+    scan_limit = 3
+    rows = [
+        ("sample-match", first_embedding, "BAAI/bge-small-en-v1.5"),
+        ("stale-one", "[1, 2, 3]", "stale/model"),
+        ("stale-two", "[1, 2, 3]", "stale/model"),
+        ("overflow-match", "[1, 2, 3]", "BAAI/bge-small-en-v1.5"),
+    ]
+
+    status = _inspect(_embedding_db(tmp_path, rows), scan_limit=scan_limit)
+
+    persisted = status["coverage"]["persisted"]
+    assert status["state"] == "active"
+    assert status["activity_evidence"] == "persisted_matching_vectors"
+    assert persisted["status"] == "scan_limited"
+    assert persisted["total_vectors"] is None
+    assert persisted["scanned_vectors"] == scan_limit
+    assert persisted["matching_model_vectors"] == (
+        2 if first_embedding == "[1, 2]" else 1
+    )
+    assert persisted["matching_dimension_vectors"] == 1
+
+
 def test_unknown_schema_metadata_does_not_invent_counts(tmp_path):
     status = _inspect(
         _embedding_db(
@@ -303,6 +353,62 @@ def test_payload_redacts_untrusted_model_metadata_from_both_renderers(tmp_path):
     assert payload["embeddings"]["fastembed_version"] is None
     assert raw_secret not in json_text
     assert raw_secret not in human_text
+
+
+@pytest.mark.parametrize(
+    "unsafe_model",
+    [
+        "sk-doctor-private-token",
+        "github_pat_doctor_private_token",
+        "../private/model",
+        "org/../private-model",
+        "relative/private/model.onnx",
+        "/absolute/private/model",
+        "C:/absolute/private/model",
+    ],
+)
+def test_payload_redacts_secret_and_path_shaped_model_metadata(unsafe_model, tmp_path):
+    report = DoctorReport(
+        bank_name="work",
+        embeddings={
+            **EmbeddingsStatusAdapter(None, runtime=_runtime()).inspect().metrics,
+            "configured_model": unsafe_model,
+            "observed_model": unsafe_model,
+        },
+    )
+
+    payload = doctor_report_payload(report)
+    json_text = render_doctor_json(payload)
+    human_text = render_doctor_markdown(payload)
+
+    assert payload["embeddings"]["configured_model"] is None
+    assert payload["embeddings"]["observed_model"] is None
+    assert unsafe_model not in json_text
+    assert unsafe_model not in human_text
+
+
+@pytest.mark.parametrize(
+    "safe_model",
+    [
+        "BAAI/bge-small-en-v1.5",
+        "text-embedding-3-small",
+        "nomic-ai/nomic-embed-text-v1.5",
+    ],
+)
+def test_payload_preserves_ordinary_safe_model_identifiers(safe_model):
+    report = DoctorReport(
+        bank_name="work",
+        embeddings={
+            **EmbeddingsStatusAdapter(None, runtime=_runtime()).inspect().metrics,
+            "configured_model": safe_model,
+            "observed_model": safe_model,
+        },
+    )
+
+    payload = doctor_report_payload(report)
+
+    assert payload["embeddings"]["configured_model"] == safe_model
+    assert payload["embeddings"]["observed_model"] == safe_model
 
 
 def test_json_and_human_output_render_same_canonical_embeddings_payload(tmp_path):
