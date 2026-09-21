@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,8 @@ _PREVIEW_CANONICAL_SECRET_PATTERNS = tuple(
 _RUNTIME_ABSOLUTE_PATH = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:~[\\/]|(?:[A-Za-z]:)?[\\/])[^\s`<>\"']+"
 )
+_SAFE_MODEL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_SAFE_PACKAGE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,79}$")
 
 
 class _SQLiteVecExtensionDisableError(RuntimeError):
@@ -79,7 +82,7 @@ _DOCTOR_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     "working_memory": frozenset({"id", "valid_until", "superseded_by"}),
     "memories": frozenset({"id"}),
     "episodic_memory": frozenset({"id", "binary_vector"}),
-    "memory_embeddings": frozenset({"memory_id"}),
+    "memory_embeddings": frozenset({"memory_id", "embedding_json", "model"}),
     "vec_working": frozenset(),
     "vec_episodes": frozenset(),
     "graph_edges": frozenset({"source", "target"}),
@@ -186,6 +189,7 @@ class DoctorReport:
     sqlite_health: dict[str, Any] = field(default_factory=dict)
     reference_contracts: dict[str, Any] = field(default_factory=dict)
     vector_coverage: dict[str, Any] = field(default_factory=dict)
+    embeddings: dict[str, Any] = field(default_factory=dict)
     hygiene_summary: dict[str, Any] = field(default_factory=dict)
     execution: dict[str, bool] = field(
         default_factory=lambda: {"read_only": True, "query_only": True, "dry_run": True}
@@ -534,6 +538,363 @@ class RuntimeDiagnosticsAdapter:
         return AdapterResult(metrics=_sanitize_runtime_diagnostics(result))
 
 
+def _safe_model_identifier(value: Any) -> str | None:
+    """Return a bounded model identifier, never a path, URL, or free-form value."""
+
+    if not isinstance(value, str) or not _SAFE_MODEL_IDENTIFIER.fullmatch(value):
+        return None
+    if value.startswith(("/", "\\")) or "//" in value:
+        return None
+    return value
+
+
+def _embedding_runtime_status() -> dict[str, Any]:
+    """Inspect embedding configuration without constructing or probing a model."""
+
+    try:
+        from mnemosyne.core import embeddings
+
+        disabled = bool(embeddings._is_disabled())
+        model = embeddings._DEFAULT_MODEL
+        backend = (
+            "openai_compatible_api"
+            if embeddings._is_api_model(model)
+            else "fastembed_local"
+        )
+        if backend == "fastembed_local":
+            backend_available: bool | None = bool(embeddings._is_fastembed_available())
+        else:
+            # Doctor must not probe a remote endpoint, so API availability is
+            # deliberately not inferred from a URL or credential being present.
+            backend_available = None
+        try:
+            version = importlib.metadata.version("fastembed")
+        except importlib.metadata.PackageNotFoundError:
+            version = None
+        if not isinstance(version, str) or not _SAFE_PACKAGE_VERSION.fullmatch(version):
+            version = None
+        return {
+            "disabled": disabled,
+            "backend": backend,
+            "backend_available": backend_available,
+            "fastembed_installed": embeddings.TextEmbedding is not None,
+            "fastembed_version": version,
+            "configured_model_raw": model,
+            "configured_model": _safe_model_identifier(model),
+            "configured_dimension": embeddings.EMBEDDING_DIM
+            if isinstance(embeddings.EMBEDDING_DIM, int)
+            and not isinstance(embeddings.EMBEDDING_DIM, bool)
+            and embeddings.EMBEDDING_DIM > 0
+            else None,
+        }
+    except Exception:
+        return {"error_class": "runtime_error"}
+
+
+class EmbeddingsStatusAdapter:
+    """Bounded status evidence for the selected embedding route and persisted rows."""
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection | None,
+        scan_limit: int = DEFAULT_SCAN_LIMIT,
+        runtime: dict[str, Any] | None = None,
+    ):
+        self.conn = conn
+        self.scan_limit = _validate_scan_limit(scan_limit)
+        self.runtime = runtime if runtime is not None else _embedding_runtime_status()
+
+    @staticmethod
+    def _empty_persisted(status: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "status": status,
+            "total_vectors": None,
+            "scanned_vectors": 0,
+            "matching_model_vectors": None,
+            "matching_dimension_vectors": None,
+            "scan_limited": False,
+            **extra,
+        }
+
+    def _persisted(self) -> tuple[dict[str, Any], str | None, int]:
+        if self.conn is None:
+            return (
+                self._empty_persisted(STATUS_UNKNOWN, error_class="sqlite_error"),
+                None,
+                0,
+            )
+        catalog = _catalog(self.conn)
+        if catalog.error_class:
+            return (
+                self._empty_persisted(STATUS_UNKNOWN, error_class=catalog.error_class),
+                None,
+                0,
+            )
+        if "memory_embeddings" not in catalog.tables:
+            return (
+                {
+                    "status": "no_vectors",
+                    "total_vectors": 0,
+                    "scanned_vectors": 0,
+                    "matching_model_vectors": 0,
+                    "matching_dimension_vectors": 0,
+                    "scan_limited": False,
+                },
+                None,
+                0,
+            )
+
+        columns = _table_columns(self.conn, "memory_embeddings", self.scan_limit)
+        required = {"model", "embedding_json"}
+        if columns.error_class:
+            return (
+                self._empty_persisted(STATUS_UNKNOWN, error_class=columns.error_class),
+                None,
+                0,
+            )
+        if not required.issubset(columns.columns):
+            detail = {"columns_truncated": True} if columns.truncated else {}
+            return self._empty_persisted(STATUS_UNKNOWN, **detail), None, 0
+
+        try:
+            rows = list(
+                self.conn.execute(
+                    "SELECT model, CASE WHEN json_valid(embedding_json) "
+                    "THEN json_array_length(embedding_json) ELSE NULL END "
+                    "FROM memory_embeddings LIMIT ?",
+                    (self.scan_limit + 1,),
+                )
+            )
+        except sqlite3.Error as error:
+            return (
+                self._empty_persisted(
+                    STATUS_UNKNOWN, error_class=_safe_sqlite_error_class(error)
+                ),
+                None,
+                0,
+            )
+
+        truncated = len(rows) > self.scan_limit
+        rows = rows[: self.scan_limit]
+        raw_model = self.runtime.get("configured_model_raw")
+        configured_dimension = self.runtime.get("configured_dimension")
+        matching_model = sum(1 for row in rows if row[0] == raw_model)
+        matching_dimension = sum(
+            1 for row in rows if row[0] == raw_model and row[1] == configured_dimension
+        )
+        metadata_known = all(
+            isinstance(row[0], str)
+            and isinstance(row[1], int)
+            and not isinstance(row[1], bool)
+            and row[1] > 0
+            for row in rows
+        )
+        models = {row[0] for row in rows if isinstance(row[0], str)}
+        dimensions = {
+            row[1]
+            for row in rows
+            if isinstance(row[1], int) and not isinstance(row[1], bool) and row[1] > 0
+        }
+        observed_model = (
+            _safe_model_identifier(next(iter(models)))
+            if not truncated and len(models) == 1
+            else None
+        )
+        observed_dimension = (
+            next(iter(dimensions)) if not truncated and len(dimensions) == 1 else None
+        )
+
+        if not rows:
+            status = "no_vectors"
+        elif truncated:
+            status = "scan_limited"
+        elif (
+            not metadata_known
+            or configured_dimension is None
+            or not isinstance(raw_model, str)
+        ):
+            status = STATUS_UNKNOWN
+        elif matching_model == 0:
+            status = "model_mismatch"
+        elif matching_model < len(rows):
+            status = "partial"
+        elif matching_dimension < matching_model:
+            status = "dimension_mismatch"
+        else:
+            status = "complete"
+
+        return (
+            {
+                "status": status,
+                "total_vectors": None if truncated else len(rows),
+                "scanned_vectors": len(rows),
+                "matching_model_vectors": matching_model,
+                "matching_dimension_vectors": matching_dimension,
+                "scan_limited": truncated,
+            },
+            observed_model,
+            observed_dimension or 0,
+        )
+
+    def inspect(self) -> AdapterResult:
+        persisted, observed_model, observed_dimension = self._persisted()
+        runtime_error = bool(self.runtime.get("error_class"))
+        disabled = self.runtime.get("disabled") is True
+        backend = self.runtime.get("backend")
+        backend_available = self.runtime.get("backend_available")
+        matching = persisted.get("matching_model_vectors")
+
+        if disabled:
+            state = "disabled"
+        elif runtime_error:
+            state = STATUS_UNKNOWN
+        elif backend == "fastembed_local" and backend_available is False:
+            state = "unavailable"
+        elif backend != "fastembed_local" or backend_available is not True:
+            state = STATUS_UNKNOWN
+        elif persisted.get("status") == STATUS_UNKNOWN:
+            state = STATUS_UNKNOWN
+        elif isinstance(matching, int) and matching > 0:
+            state = "active"
+        else:
+            state = "available"
+
+        metrics = {
+            "state": state,
+            "configured": None if runtime_error else not disabled,
+            "backend": backend
+            if backend in {"fastembed_local", "openai_compatible_api"}
+            else None,
+            "backend_available": backend_available
+            if isinstance(backend_available, bool)
+            else None,
+            "fastembed_installed": self.runtime.get("fastembed_installed")
+            if isinstance(self.runtime.get("fastembed_installed"), bool)
+            else None,
+            "fastembed_version": self.runtime.get("fastembed_version"),
+            "configured_model": self.runtime.get("configured_model"),
+            "observed_model": observed_model,
+            "configured_dimension": self.runtime.get("configured_dimension"),
+            "observed_dimension": observed_dimension or None,
+            "runtime_scope": "current_process",
+            "activity_evidence": "persisted_matching_vectors"
+            if state == "active"
+            else None,
+            "pending_vectors": None,
+            "failed_vectors": None,
+            "model_revision": None,
+            "distance_metric": None,
+            "index_last_updated": None,
+            "coverage": {"persisted": persisted},
+        }
+        return AdapterResult(metrics=metrics)
+
+
+def _nonnegative_int_or_none(value: Any) -> int | None:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else None
+    )
+
+
+def _sanitize_embeddings_status(
+    embeddings: Any, vector_coverage: Any
+) -> dict[str, Any]:
+    """Enforce the fixed, content-free public embeddings status schema."""
+
+    source = embeddings if isinstance(embeddings, dict) else {}
+    state = source.get("state")
+    if state not in {"disabled", "unavailable", "available", "active", STATUS_UNKNOWN}:
+        state = STATUS_UNKNOWN
+    backend = source.get("backend")
+    if backend not in {"fastembed_local", "openai_compatible_api"}:
+        backend = None
+    version = source.get("fastembed_version")
+    if not isinstance(version, str) or not _SAFE_PACKAGE_VERSION.fullmatch(version):
+        version = None
+
+    raw_coverage = source.get("coverage")
+    raw_coverage = raw_coverage if isinstance(raw_coverage, dict) else {}
+    raw_persisted = raw_coverage.get("persisted")
+    raw_persisted = raw_persisted if isinstance(raw_persisted, dict) else {}
+    persisted_status = raw_persisted.get("status")
+    if persisted_status not in {
+        "no_vectors",
+        "complete",
+        "partial",
+        "scan_limited",
+        "model_mismatch",
+        "dimension_mismatch",
+        STATUS_UNKNOWN,
+    }:
+        persisted_status = STATUS_UNKNOWN
+    persisted: dict[str, Any] = {
+        "status": persisted_status,
+        "total_vectors": _nonnegative_int_or_none(raw_persisted.get("total_vectors")),
+        "scanned_vectors": _nonnegative_int_or_none(
+            raw_persisted.get("scanned_vectors")
+        )
+        or 0,
+        "matching_model_vectors": _nonnegative_int_or_none(
+            raw_persisted.get("matching_model_vectors")
+        ),
+        "matching_dimension_vectors": _nonnegative_int_or_none(
+            raw_persisted.get("matching_dimension_vectors")
+        ),
+        "scan_limited": raw_persisted.get("scan_limited") is True,
+    }
+    if raw_persisted.get("error_class") in {
+        "sqlite_error",
+        "operational_error",
+        "database_error",
+    }:
+        persisted["error_class"] = raw_persisted["error_class"]
+    if raw_persisted.get("columns_truncated") is True:
+        persisted["columns_truncated"] = True
+
+    tiers = vector_coverage if isinstance(vector_coverage, dict) else {}
+    configured = source.get("configured")
+    backend_available = source.get("backend_available")
+    fastembed_installed = source.get("fastembed_installed")
+    configured_dimension = _nonnegative_int_or_none(source.get("configured_dimension"))
+    observed_dimension = _nonnegative_int_or_none(source.get("observed_dimension"))
+    return {
+        "state": state,
+        "configured": configured if isinstance(configured, bool) else None,
+        "backend": backend,
+        "backend_available": backend_available
+        if isinstance(backend_available, bool)
+        else None,
+        "fastembed_installed": fastembed_installed
+        if isinstance(fastembed_installed, bool)
+        else None,
+        "fastembed_version": version,
+        "configured_model": _safe_model_identifier(source.get("configured_model")),
+        "observed_model": _safe_model_identifier(source.get("observed_model")),
+        "configured_dimension": configured_dimension if configured_dimension else None,
+        "observed_dimension": observed_dimension if observed_dimension else None,
+        "runtime_scope": "current_process",
+        "activity_evidence": (
+            "persisted_matching_vectors"
+            if state == "active"
+            and source.get("activity_evidence") == "persisted_matching_vectors"
+            else None
+        ),
+        "pending_vectors": None,
+        "failed_vectors": None,
+        "model_revision": None,
+        "distance_metric": None,
+        "index_last_updated": None,
+        "coverage": {
+            "working": tiers.get("working", {"status": STATUS_UNKNOWN}),
+            "episodic": tiers.get("episodic", {"status": STATUS_UNKNOWN}),
+            "persisted": persisted,
+        },
+    }
+
+
+
 class HygieneSummaryAdapter:
     """Use only the bounded, content-safe hygiene doctor view on a supplied DB."""
 
@@ -643,9 +1004,13 @@ def build_doctor_report(
     """
 
     scan_limit = _validate_scan_limit(scan_limit)
+    embedding_runtime = _embedding_runtime_status()
     report = DoctorReport(
         bank_name=bank_name,
         runtime_diagnostics=RuntimeDiagnosticsAdapter().inspect().metrics,
+        embeddings=EmbeddingsStatusAdapter(
+            None, scan_limit=scan_limit, runtime=embedding_runtime
+        ).inspect().metrics,
     )
     try:
         report.database_identity = _database_identity(db_path)
@@ -679,6 +1044,19 @@ def build_doctor_report(
         report.sqlite_health = sqlite_health.metrics
         report.reference_contracts = reference_contracts.metrics
         report.vector_coverage = vector_coverage.metrics
+        report.embeddings = EmbeddingsStatusAdapter(
+            conn, scan_limit=scan_limit, runtime=embedding_runtime
+        ).inspect().metrics
+        report.embeddings["coverage"].update(
+            {
+                "working": report.vector_coverage.get(
+                    "working", {"status": STATUS_UNKNOWN}
+                ),
+                "episodic": report.vector_coverage.get(
+                    "episodic", {"status": STATUS_UNKNOWN}
+                ),
+            }
+        )
         report.findings.extend(sqlite_health.findings)
         report.findings.extend(reference_contracts.findings)
         report.findings.extend(vector_coverage.findings)
@@ -701,6 +1079,9 @@ def doctor_report_payload(report: DoctorReport, *, include_candidates: bool = Fa
 
     payload = report.to_dict()
     payload["runtime_diagnostics"] = _sanitize_runtime_diagnostics(payload.get("runtime_diagnostics"))
+    payload["embeddings"] = _sanitize_embeddings_status(
+        payload.get("embeddings"), payload.get("vector_coverage")
+    )
     hygiene = payload.get("hygiene_summary")
     if isinstance(hygiene, dict):
         hygiene["candidates"] = _content_free_hygiene_candidates(hygiene.get("candidates"))
@@ -837,6 +1218,9 @@ def render_doctor_markdown(payload: dict[str, Any]) -> str:
                 )
     else:
         lines.append(f"- status: `{_compact_json(runtime_diagnostics)}`")
+
+    lines.extend(["", "## Embeddings", ""])
+    _append_metric_lines(lines, payload.get("embeddings"))
 
     lines.extend(["", "## References", ""])
     _append_metric_lines(lines, payload.get("reference_contracts"))
@@ -1001,7 +1385,13 @@ def _contains_status(value: Any, status: str) -> bool:
 
 def _degradation_notes(payload: dict[str, Any]) -> list[str]:
     notes: list[str] = []
-    for section in ("sqlite_health", "reference_contracts", "vector_coverage", "hygiene_summary"):
+    for section in (
+        "sqlite_health",
+        "reference_contracts",
+        "vector_coverage",
+        "embeddings",
+        "hygiene_summary",
+    ):
         value = payload.get(section)
         if not isinstance(value, dict):
             continue
