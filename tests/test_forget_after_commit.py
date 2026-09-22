@@ -341,3 +341,29 @@ def test_raw_rollback_transaction_clears_hooks(tmp_path: Path, use_cursor: bool)
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
     ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "statement, survives",
+    [("-- audit\nCOMMIT", False), ("/* audit */ ROLLBACK TRANSACTION", True)],
+)
+@pytest.mark.parametrize("use_cursor", [False, True])
+def test_commented_raw_terminators_keep_hooks_consistent(
+    tmp_path: Path, statement: str, survives: bool, use_cursor: bool
+):
+    """Leading SQL comments must not bypass transaction hook handling."""
+    mem, events = _mem_with_events(
+        tmp_path, f"commented-{survives}-{use_cursor}.db"
+    )
+    mid = mem.beam.remember("commented transaction row", source="test")
+    mem.conn.execute("BEGIN")
+    assert mem.forget(mid) is True
+
+    executor = mem.conn.cursor().execute if use_cursor else mem.conn.execute
+    executor(statement)
+
+    assert events == [] if survives else [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn._after_commit_hooks == []  # noqa: SLF001
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == (1 if survives else 0)

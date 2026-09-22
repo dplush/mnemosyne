@@ -1907,6 +1907,18 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
     )
 
 
+_LEADING_SQL_COMMENTS_RE = re.compile(
+    r"(?:\s|--[^\r\n]*(?:\r\n|\r|\n|$)|/\*.*?\*/)*", re.DOTALL
+)
+
+
+def _strip_leading_sql_comments(sql):
+    """Return SQL after whitespace and complete leading comments."""
+    if not isinstance(sql, str):
+        return sql
+    return _LEADING_SQL_COMMENTS_RE.sub("", sql, count=1)
+
+
 _SAVEPOINT_STMT_RE = re.compile(
     r"""^\s*(?P<verb>COMMIT|END|SAVEPOINT|RELEASE|ROLLBACK)\s*"""
     r"""(?:(?:TRANSACTION|TO|SAVEPOINT)(?:\s+|(?=\s*;|\s*$)))*"""
@@ -2063,7 +2075,7 @@ class _BeamConnection(sqlite3.Connection):
         """True when this RELEASE could implicitly commit (see #963)."""
         if self._defer_commit or not self.in_transaction or not isinstance(sql, str):
             return False
-        match = _SAVEPOINT_STMT_RE.match(sql)
+        match = _SAVEPOINT_STMT_RE.match(_strip_leading_sql_comments(sql))
         return match is not None and match.group("verb").upper() in {
             "COMMIT",
             "END",
@@ -2079,6 +2091,7 @@ class _BeamConnection(sqlite3.Connection):
         guessed at (dropping outer hooks would silently lose real
         events). Duplicate names resolve innermost-first.
         """
+        sql = _strip_leading_sql_comments(sql)
         if not isinstance(sql, str):
             return
         head = sql.lstrip()[:9].upper()
