@@ -2210,7 +2210,7 @@ def _guarded_transaction(conn: sqlite3.Connection):
 
 
 @contextlib.contextmanager
-def _deferred_commits(conn: sqlite3.Connection):
+def _deferred_commits(conn: sqlite3.Connection, *, immediate: bool = False):
     """Defer nested commits without stealing a caller-owned transaction.
 
     A BEAM-owned batch starts and commits its own transaction.  When a caller
@@ -2228,7 +2228,7 @@ def _deferred_commits(conn: sqlite3.Connection):
     savepoint = conn._next_savepoint_name("deferred_commits")
     previously_deferred = conn._defer_commit
     if owns_transaction:
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     else:
         conn.execute(f"SAVEPOINT {savepoint}")
     conn._defer_commit = True
@@ -6884,31 +6884,59 @@ class BeamMemory:
 
         return None
 
+    @staticmethod
+    def _delete_unambiguous_memory_children(cursor, memory_id: str) -> None:
+        """Delete child rows after the caller proves no other tier owns the ID.
+
+        ``annotations``, ``memory_embeddings``, and ``gists`` currently carry
+        only ``memory_id``. They cannot distinguish a working parent from an
+        episodic parent when both tiers contain the same ID. Callers must retain
+        those ambiguous rows while another parent survives; guessing ownership
+        here would turn a tier-local forget into cross-tier data loss (#1002).
+        """
+        cursor.execute("DELETE FROM annotations WHERE memory_id = ?", (memory_id,))
+        cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+        gists_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
+        ).fetchone()
+        if gists_table is not None:
+            cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+
     def forget_working(self, memory_id: str) -> bool:
-        """Delete a session-authorized working memory row and its cascade
-        (vector, annotations, embeddings, gists) atomically."""
-        # E6.a: the cascade-delete of annotations must be authorized by the
-        # session-scoped working_memory DELETE. The annotations table has no
-        # session_id column, so an unconditional `DELETE FROM annotations
-        # WHERE memory_id = ?` lets a hostile caller in session B pass a
-        # memory_id from session A and silently wipe session A's annotations
-        # -- adversarial /review found this. The session-scoped working_memory
-        # DELETE is the trust boundary: if it matches a row, the caller is
-        # authorized to delete the row's annotations. If it matches zero
-        # rows (wrong session, or already-forgotten), we skip the cascade.
-        #
-        # Wrapped in an explicit transaction with rollback so a mid-cascade
-        # failure (corrupted table, lock contention, future FK trigger)
-        # rolls back the working_memory DELETE rather than leaving it
-        # uncommitted on the connection for a later unrelated commit to
-        # silently include.
+        """Delete an authorized working row without crossing tier ownership.
+
+        Tier-specific vectors are always safe to remove. Shared child rows are
+        removed only when no episodic parent with the same ID survives.
+        A caller-owned transaction must already hold an immediate write lock so
+        the parent set cannot change between the ownership probe and cascade.
+        """
+        # E6.a: the session-scoped parent DELETE is the authorization boundary.
+        # Child tables have no session_id, so no cascade runs after a miss.
         cursor = self.conn.cursor()
         owns_transaction = not self.conn.in_transaction
         with _guarded_transaction(self.conn):
+            if owns_transaction:
+                # Freeze the parent set before ownership checks. Otherwise a
+                # concurrent same-ID insert can arrive before the cascade.
+                cursor.execute("BEGIN IMMEDIATE")
             authorized_row = cursor.execute(
                 "SELECT rowid FROM working_memory WHERE id = ? AND (session_id = ? OR scope = 'global')",
                 (memory_id, self.session_id),
             ).fetchone()
+            competing_parent = cursor.execute(
+                "SELECT 1 FROM episodic_memory WHERE id = ? LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+            if competing_parent is None:
+                legacy_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'memories'"
+                ).fetchone()
+                if legacy_table is not None:
+                    competing_parent = cursor.execute(
+                        "SELECT 1 FROM memories WHERE id = ? LIMIT 1",
+                        (memory_id,),
+                    ).fetchone()
             if authorized_row is not None and _wm_vec_available(self.conn):
                 cursor.execute("DELETE FROM vec_working WHERE rowid = ?", (int(authorized_row["rowid"]),))
             cursor.execute(
@@ -6916,21 +6944,70 @@ class BeamMemory:
                 (memory_id, self.session_id),
             )
             wm_rows = cursor.rowcount
-            if wm_rows > 0:
-                cursor.execute(
-                    "DELETE FROM annotations WHERE memory_id = ?", (memory_id,)
-                )
-                cursor.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
-                gists_table = cursor.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gists'"
-                ).fetchone()
-                if gists_table is not None:
-                    cursor.execute("DELETE FROM gists WHERE memory_id = ?", (memory_id,))
+            if wm_rows > 0 and competing_parent is None:
+                self._delete_unambiguous_memory_children(cursor, memory_id)
         forgotten = wm_rows > 0
         if forgotten:
             if owns_transaction:
                 self._invalidate_query_cache_after_commit("forget_working")
             else:
+                self._invalidate_query_cache()
+        return forgotten
+
+    def forget_episodic(self, memory_id: str) -> bool:
+        """Delete an authorized episodic row without crossing tier ownership.
+
+        The session-or-global predicate mirrors ``forget_working``. Shared
+        children are retained whenever a working or legacy parent with the same
+        ID survives because the current schema cannot prove their owning tier.
+        A caller-owned transaction must already hold an immediate write lock so
+        the parent set cannot change between the ownership probe and cascade.
+        """
+        cursor = self.conn.cursor()
+        owns_transaction = not self.conn.in_transaction
+        with _guarded_transaction(self.conn):
+            if owns_transaction:
+                # Keep the ownership probe and cascade under one write lock.
+                cursor.execute("BEGIN IMMEDIATE")
+            authorized_row = cursor.execute(
+                "SELECT rowid FROM episodic_memory "
+                "WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            ).fetchone()
+            competing_parent = cursor.execute(
+                "SELECT 1 FROM working_memory WHERE id = ? LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+            if competing_parent is None:
+                legacy_table = cursor.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'memories'"
+                ).fetchone()
+                if legacy_table is not None:
+                    competing_parent = cursor.execute(
+                        "SELECT 1 FROM memories WHERE id = ? LIMIT 1",
+                        (memory_id,),
+                    ).fetchone()
+            if authorized_row is not None and _vec_available(self.conn):
+                cursor.execute(
+                    "DELETE FROM vec_episodes WHERE rowid = ?",
+                    (int(authorized_row["rowid"]),),
+                )
+            cursor.execute(
+                "DELETE FROM episodic_memory "
+                "WHERE id = ? AND (session_id = ? OR scope = 'global')",
+                (memory_id, self.session_id),
+            )
+            episodic_rows = cursor.rowcount
+            if episodic_rows > 0 and competing_parent is None:
+                self._delete_unambiguous_memory_children(cursor, memory_id)
+        forgotten = episodic_rows > 0
+        if forgotten:
+            if owns_transaction:
+                self._invalidate_query_cache_after_commit("forget_episodic")
+            else:
+                # The deleted row is visible to reads in this transaction.
+                # Invalidate now; rollback can safely leave a cache miss.
                 self._invalidate_query_cache()
         return forgotten
 

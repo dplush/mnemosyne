@@ -134,7 +134,9 @@ def apply_beam_batch(
     current = {"index": None, "action": None}
     try:
         from mnemosyne.core.filters import write_policy_operation
-        with write_policy_operation(write_policy), _deferred_commits(beam.conn):
+        with write_policy_operation(write_policy), _deferred_commits(
+            beam.conn, immediate=True
+        ):
             for current in normalized:
                 results.append(_apply_one(
                     beam,
@@ -227,6 +229,10 @@ def _apply_one(
         return {"index": index, "action": action, "status": "updated", "memory_id": memory_id}
     if action == "forget":
         ok = beam.forget_working(memory_id)
+        if not ok:
+            forget_episodic = getattr(beam, "forget_episodic", None)
+            if forget_episodic is not None:
+                ok = forget_episodic(memory_id)
         if not ok:
             raise BatchOperationError("memory_not_found")
         audit_events.append(("forget", {"memory_id": memory_id, "bank": "private", "source_tool": remember_source_tool}))

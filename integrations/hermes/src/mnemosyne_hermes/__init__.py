@@ -3826,6 +3826,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                         )
                     elif action == "forget":
                         ok = replay_beam.forget_working(memory_id)
+                        if not ok:
+                            forget_episodic = getattr(
+                                replay_beam, "forget_episodic", None
+                            )
+                            if forget_episodic is not None:
+                                ok = forget_episodic(memory_id)
                     elif action == "invalidate":
                         ok = replay_beam.invalidate(
                             memory_id,
@@ -4012,6 +4018,12 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
         ok = self._beam.forget_working(memory_id)
+        if not ok:
+            # Core releases before the episodic fallback do not expose this
+            # method. Preserve their not_found behavior instead of raising.
+            forget_episodic = getattr(self._beam, "forget_episodic", None)
+            if forget_episodic is not None:
+                ok = forget_episodic(memory_id)
         if ok:
             self._audit_event(
                 "forget", memory_id=memory_id, bank="private",

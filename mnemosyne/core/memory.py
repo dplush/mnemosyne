@@ -822,8 +822,9 @@ class Mnemosyne:
         return self.beam.get(memory_id)
 
     def forget(self, memory_id: str) -> bool:
-        """Delete a memory by ID from legacy table and working_memory."""
-        with _deferred_commits(self.conn):
+        """Delete a memory by ID from legacy, working, or episodic storage."""
+        emit_invalidation = True
+        with _deferred_commits(self.conn, immediate=True):
             cursor = self.conn.cursor()
             # Authorize from the authoritative BEAM row before deleting either
             # representation. A global row may be removed cross-session, but
@@ -844,13 +845,16 @@ class Mnemosyne:
                     (memory_id, self.session_id),
                 ).fetchone()
                 if legacy_owner is None:
-                    return False
-                cursor.execute(
-                    "DELETE FROM memories WHERE id = ? AND session_id = ?",
-                    (memory_id, self.session_id),
-                )
-                self.conn.commit()
-                result = False
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidation = result
+                else:
+                    cursor.execute(
+                        "DELETE FROM memories WHERE id = ? AND session_id = ?",
+                        (memory_id, self.session_id),
+                    )
+                    self.conn.commit()
+                    result = self.beam.forget_episodic(memory_id)
+                    emit_invalidation = result
             else:
                 cursor.execute(
                     "DELETE FROM memories WHERE id = ? AND session_id = ?",
@@ -859,11 +863,10 @@ class Mnemosyne:
                 self.conn.commit()
                 result = self.beam.forget_working(memory_id)
         # Emit after _deferred_commits finalizes, and defer past a
-        # caller-owned transaction: emitting immediately here would fire
-        # before the caller's commit — a phantom event if they roll back
-        # (see #963). _emit_after_commit emits at once when we owned the
-        # transaction, or queues an after-commit hook otherwise.
-        self._emit_after_commit("MEMORY_INVALIDATED", memory_id)
+        # caller-owned transaction. A missing/unauthorized episodic row must
+        # not publish a successful invalidation.
+        if emit_invalidation:
+            self._emit_after_commit("MEMORY_INVALIDATED", memory_id)
         return result
 
     def update(self, memory_id: str, content: str = None,

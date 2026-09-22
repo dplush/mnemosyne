@@ -124,7 +124,7 @@ def test_hook_registered_by_hook_defers_to_next_commit(tmp_path: Path):
 
 
 def test_legacy_only_emit_follows_caller_commit(tmp_path: Path):
-    """Legacy-mirror deletes emit on caller commit, never on rollback."""
+    """Legacy-only cleanup returns false and emits no invalidation."""
     mem, events = _mem_with_events(tmp_path)
     mem.conn.execute(
         "CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, content TEXT, "
@@ -139,7 +139,10 @@ def test_legacy_only_emit_follows_caller_commit(tmp_path: Path):
     assert mem.forget("leg-1") is False
     assert events == []
     mem.conn.commit()
-    assert events == [(("MEMORY_INVALIDATED", "leg-1"), {})]
+    assert events == []
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE id = 'leg-1'"
+    ).fetchone()[0] == 0
 
     mem.conn.execute(
         "INSERT INTO memories (id, content, session_id) VALUES ('leg-2', 'x', 'ac-test')"
@@ -148,7 +151,7 @@ def test_legacy_only_emit_follows_caller_commit(tmp_path: Path):
     mem.conn.execute("BEGIN")
     assert mem.forget("leg-2") is False
     mem.conn.rollback()
-    assert len(events) == 1
+    assert events == []
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM memories WHERE id = 'leg-2'"
     ).fetchone()[0] == 1

@@ -2228,6 +2228,72 @@ def test_provider_batch_dispatch_matches(tmp_path, provider_modules):
     }
 
 
+class _ForgetFallbackBeam:
+    def __init__(self, *, episodic_result=True):
+        self.calls = []
+        self.episodic_result = episodic_result
+
+    def forget_working(self, memory_id):
+        self.calls.append(("working", memory_id))
+        return False
+
+    def forget_episodic(self, memory_id):
+        self.calls.append(("episodic", memory_id))
+        return self.episodic_result
+
+
+class _BeamWithoutEpisodicForget:
+    def forget_working(self, memory_id):
+        return False
+
+
+def test_forget_falls_back_to_episodic_in_both_providers(provider_modules):
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = _ForgetFallbackBeam()
+        provider._audit_event = lambda *args, **kwargs: None
+
+        result = json.loads(provider._handle_forget({"memory_id": "episode"}))
+
+        assert result == {"status": "deleted", "memory_id": "episode"}, name
+        assert provider._beam.calls == [
+            ("working", "episode"),
+            ("episodic", "episode"),
+        ], name
+
+
+def test_forget_returns_not_found_when_both_tiers_miss(provider_modules):
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = _ForgetFallbackBeam(episodic_result=False)
+        provider._audit_event = lambda *args, **kwargs: None
+
+        result = json.loads(provider._handle_forget({"memory_id": "missing"}))
+
+        assert result == {"status": "not_found", "memory_id": "missing"}, name
+        assert provider._beam.calls == [
+            ("working", "missing"),
+            ("episodic", "missing"),
+        ], name
+
+
+def test_forget_keeps_older_core_compatibility_in_both_providers(provider_modules):
+    for name, module in provider_modules.items():
+        provider = module.MnemosyneMemoryProvider.__new__(
+            module.MnemosyneMemoryProvider
+        )
+        provider._beam = _BeamWithoutEpisodicForget()
+        provider._audit_event = lambda *args, **kwargs: None
+
+        result = json.loads(provider._handle_forget({"memory_id": "episode"}))
+
+        assert result == {"status": "not_found", "memory_id": "episode"}, name
+
+
 class _ScopeRecordingBeam:
     def __init__(self):
         self.session_id = "active-session"
