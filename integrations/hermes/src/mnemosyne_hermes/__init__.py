@@ -249,6 +249,17 @@ def _get_beam_class():
     return BeamMemory
 
 
+def _forget_with_episodic_fallback(beam: Any, memory_id: str) -> bool:
+    """Forget from working memory, then episodic memory when supported."""
+    ok = beam.forget_working(memory_id)
+    if not ok:
+        # Older core releases do not expose the episodic forget method.
+        forget_episodic = getattr(beam, "forget_episodic", None)
+        if forget_episodic is not None:
+            ok = forget_episodic(memory_id)
+    return bool(ok)
+
+
 def _get_working_memory_ttl_hours() -> int:
     from mnemosyne.core.beam import WORKING_MEMORY_TTL_HOURS
     return WORKING_MEMORY_TTL_HOURS
@@ -3825,13 +3836,9 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                             _write_policy=policy,
                         )
                     elif action == "forget":
-                        ok = replay_beam.forget_working(memory_id)
-                        if not ok:
-                            forget_episodic = getattr(
-                                replay_beam, "forget_episodic", None
-                            )
-                            if forget_episodic is not None:
-                                ok = forget_episodic(memory_id)
+                        ok = _forget_with_episodic_fallback(
+                            replay_beam, memory_id
+                        )
                     elif action == "invalidate":
                         ok = replay_beam.invalidate(
                             memory_id,
@@ -4017,13 +4024,7 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         memory_id = args.get("memory_id", "").strip()
         if not memory_id:
             return json.dumps({"error": "memory_id is required"})
-        ok = self._beam.forget_working(memory_id)
-        if not ok:
-            # Core releases before the episodic fallback do not expose this
-            # method. Preserve their not_found behavior instead of raising.
-            forget_episodic = getattr(self._beam, "forget_episodic", None)
-            if forget_episodic is not None:
-                ok = forget_episodic(memory_id)
+        ok = _forget_with_episodic_fallback(self._beam, memory_id)
         if ok:
             self._audit_event(
                 "forget", memory_id=memory_id, bank="private",
