@@ -1944,6 +1944,13 @@ class _BeamCursor(sqlite3.Cursor):
             conn._drain_after_commit_hooks()
         return cursor
 
+    def executescript(self, sql_script):
+        """Drain hooks at SQLite's implicit pre-script commit (see #963)."""
+        conn = self.connection
+        if conn.in_transaction:
+            conn._real_commit()
+        return super().executescript(sql_script)
+
 
 class _BeamConnection(sqlite3.Connection):
     """sqlite3.Connection subclass that supports deferring commits.
@@ -2045,6 +2052,12 @@ class _BeamConnection(sqlite3.Connection):
             self._savepoint_hook_marks.clear()
             self._drain_after_commit_hooks()
         return cursor
+
+    def executescript(self, sql_script):
+        """Drain hooks at SQLite's implicit pre-script commit (see #963)."""
+        if self.in_transaction:
+            self._real_commit()
+        return super().executescript(sql_script)
 
     def _release_may_commit(self, sql) -> bool:
         """True when this RELEASE could implicitly commit (see #963)."""

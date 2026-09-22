@@ -12,8 +12,10 @@ on the next real commit and is discarded unseen on rollback.
 """
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
+import pytest
 from mnemosyne.core.memory import Mnemosyne
 
 
@@ -265,3 +267,41 @@ def test_cursor_outermost_savepoint_release_emits_on_implicit_commit(tmp_path: P
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
     ).fetchone()[0] == 0
+
+
+def test_connection_executescript_drains_hook_before_script(tmp_path: Path):
+    """Connection executescript emits at SQLite's implicit commit (#963)."""
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("script row", source="test")
+    mem.conn.execute("BEGIN")
+    assert mem.forget(mid) is True
+    assert events == []
+
+    mem.conn.executescript(
+        "CREATE TABLE script_marker (value TEXT);"
+        "INSERT INTO script_marker VALUES ('after-commit');"
+    )
+
+    assert events == [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn._after_commit_hooks == []  # noqa: SLF001
+    assert mem.conn.execute("SELECT value FROM script_marker").fetchone()[0] == (
+        "after-commit"
+    )
+
+
+def test_cursor_executescript_drains_hook_when_script_fails(tmp_path: Path):
+    """Cursor executescript does not retain hooks after implicit commit."""
+    mem, events = _mem_with_events(tmp_path)
+    mid = mem.beam.remember("failing script row", source="test")
+    mem.conn.execute("BEGIN")
+    assert mem.forget(mid) is True
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        mem.conn.cursor().executescript(
+            "CREATE TABLE script_marker (value TEXT);"
+            "INSERT INTO missing_script_table VALUES ('fails');"
+        )
+
+    assert events == [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn._after_commit_hooks == []  # noqa: SLF001
+    assert mem.conn.in_transaction is False
