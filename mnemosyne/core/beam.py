@@ -1908,8 +1908,8 @@ def _init_beam_locked(db_path: Path) -> BeamInitResult:
 
 
 _SAVEPOINT_STMT_RE = re.compile(
-    r"""^\s*(?P<verb>SAVEPOINT|RELEASE|ROLLBACK)\s*"""
-    r"""(?:(?:TRANSACTION|TO|SAVEPOINT)\s+)*"""
+    r"""^\s*(?P<verb>COMMIT|END|SAVEPOINT|RELEASE|ROLLBACK)\s*"""
+    r"""(?:(?:TRANSACTION|TO|SAVEPOINT)(?:\s+|(?=\s*;|\s*$)))*"""
     r"""(?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|\[(?P<br>[^\]]+)\]|"""
     r"""`(?P<bt>[^`]+)`|(?P<bare>[^\s;]+))?""",
     re.IGNORECASE,
@@ -1931,7 +1931,7 @@ class _BeamCursor(sqlite3.Cursor):
         release_check = getattr(conn, "_release_may_commit", None)
         # Pre-state must be read before execution: after a RELEASE that
         # implicitly commits, in_transaction is already False.
-        watching_release = bool(
+        watching_commit = bool(
             track is not None
             and release_check is not None
             and release_check(sql)
@@ -1939,7 +1939,7 @@ class _BeamCursor(sqlite3.Cursor):
         cursor = super().execute(sql, *args, **kwargs)
         if track is not None:
             track(sql)
-        if watching_release and not conn.in_transaction:
+        if watching_commit and not conn.in_transaction:
             conn._savepoint_hook_marks.clear()
             conn._drain_after_commit_hooks()
         return cursor
@@ -2064,7 +2064,11 @@ class _BeamConnection(sqlite3.Connection):
         if self._defer_commit or not self.in_transaction or not isinstance(sql, str):
             return False
         match = _SAVEPOINT_STMT_RE.match(sql)
-        return match is not None and match.group("verb").upper() == "RELEASE"
+        return match is not None and match.group("verb").upper() in {
+            "COMMIT",
+            "END",
+            "RELEASE",
+        }
 
     def _track_savepoint_statement(self, sql) -> None:
         """Mirror one savepoint statement onto the hook-queue marks.

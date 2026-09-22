@@ -305,3 +305,39 @@ def test_cursor_executescript_drains_hook_when_script_fails(tmp_path: Path):
     assert events == [(("MEMORY_INVALIDATED", mid), {})]
     assert mem.conn._after_commit_hooks == []  # noqa: SLF001
     assert mem.conn.in_transaction is False
+
+
+@pytest.mark.parametrize("statement", ["COMMIT", "END"])
+@pytest.mark.parametrize("use_cursor", [False, True])
+def test_raw_commit_terminators_drain_hooks(
+    tmp_path: Path, statement: str, use_cursor: bool
+):
+    """Raw COMMIT/END must emit queued hooks in either execute path (#963)."""
+    mem, events = _mem_with_events(tmp_path, f"raw-{statement}-{use_cursor}.db")
+    mid = mem.beam.remember("raw commit row", source="test")
+    mem.conn.execute("BEGIN")
+    assert mem.forget(mid) is True
+
+    executor = mem.conn.cursor().execute if use_cursor else mem.conn.execute
+    executor(statement)
+
+    assert events == [(("MEMORY_INVALIDATED", mid), {})]
+    assert mem.conn._after_commit_hooks == []  # noqa: SLF001
+
+
+@pytest.mark.parametrize("use_cursor", [False, True])
+def test_raw_rollback_transaction_clears_hooks(tmp_path: Path, use_cursor: bool):
+    """Raw ROLLBACK TRANSACTION must suppress queued hooks in both paths."""
+    mem, events = _mem_with_events(tmp_path, f"raw-rollback-{use_cursor}.db")
+    mid = mem.beam.remember("raw rollback row", source="test")
+    mem.conn.execute("BEGIN")
+    assert mem.forget(mid) is True
+
+    executor = mem.conn.cursor().execute if use_cursor else mem.conn.execute
+    executor("ROLLBACK TRANSACTION")
+
+    assert events == []
+    assert mem.conn._after_commit_hooks == []  # noqa: SLF001
+    assert mem.conn.execute(
+        "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
+    ).fetchone()[0] == 1
