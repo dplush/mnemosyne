@@ -362,7 +362,7 @@ def test_commented_raw_terminators_keep_hooks_consistent(
     executor = mem.conn.cursor().execute if use_cursor else mem.conn.execute
     executor(statement)
 
-    assert events == [] if survives else [(("MEMORY_INVALIDATED", mid), {})]
+    assert events == ([] if survives else [(("MEMORY_INVALIDATED", mid), {})])
     assert mem.conn._after_commit_hooks == []  # noqa: SLF001
     assert mem.conn.execute(
         "SELECT COUNT(*) FROM working_memory WHERE id = ?", (mid,)
