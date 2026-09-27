@@ -196,9 +196,17 @@ that selected interpreter needs longer to resolve its site-packages or import
 `mnemosyne_hermes`. `SECONDS` must be positive and finite: zero, negative,
 `NaN`, and infinite values are rejected.
 
+First create a persistent Mnemosyne side venv outside Hermes' replaceable core/PM
+venv, using a Python with the same major/minor version as Hermes. Install a
+compatible released `mnemosyne-hermes`/core pair into that side venv: the
+integration requires `mnemosyne-memory[embeddings]`; choose
+`mnemosyne-memory[all]` only if its additional local-LLM dependencies are needed.
+Follow the [persistent side-venv wrapper setup](../../docs/hermes-integration.md#persistent-side-venv-wrapper-mode)
+for the package/profile selection and installation steps.
+
 ```bash
-mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --import-timeout 90
-mnemosyne-hermes install --mode wrapper --python /path/to/hermes/venv/bin/python --no-bootstrap --import-timeout 90
+mnemosyne-hermes install --mode wrapper --python /path/to/persistent/mnemosyne-venv/bin/python --import-timeout 90
+mnemosyne-hermes install --mode wrapper --python /path/to/persistent/mnemosyne-venv/bin/python --no-bootstrap --import-timeout 90
 ```
 
 The second form still validates the selected wrapper interpreter; `--no-bootstrap`
