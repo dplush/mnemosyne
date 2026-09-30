@@ -86,6 +86,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
 
 ### Fixed
 
+- **Embedding opt-out aliases now parse Boolean values consistently (#1061).** `MNEMOSYNE_NO_EMBEDDINGS`, `MNEMOSYNE_SKIP_EMBEDDINGS` and `MNEMOSYNE_EMBEDDINGS_OFF` accept trimmed, case-insensitive `1/true/yes/on` and `0/false/no/off`; blank/unset means false. Every alias is validated before combining them, and other nonempty values now raise `ValueError` instead of silently disabling embeddings. Opt-out is checked before local loading, public API embedding dispatch and cached query results, including after the query cache is warmed. Re-enabling preserves normal cache reuse. This change is ENV-only; YAML model/dimension/endpoint resolution remains separate (#818).
 - **Doctor and Repair share sqlite-vec capability for `vec0` databases (#1040 D1).** Repair loads the optional extension on planning and bound write connections to match Doctor's schema checks; without the `embeddings` extra, unverifiable schemas remain fail-closed. The separate D2–D4 restrictions remain unresolved.
 - **Malformed Hermes `sync_roles` config now warns while remaining fail-closed (#1033).** Comma-separated strings and native role lists remain supported; explicit empty values still disable autosave. Invalid non-empty values, including stringified lists, no longer fail silently or broaden capture, and role precedence is recomputed on provider reinitialization so stale overrides do not persist.
 
