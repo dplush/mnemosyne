@@ -105,6 +105,22 @@ def is_configured(modality: str = "image") -> bool:
 # Payload construction
 # ---------------------------------------------------------------------------
 
+def _guess_mime(uri: Optional[str]) -> Optional[str]:
+    """Type from the file name when the caller gave none.
+
+    Vision endpoints validate the data URI's media type; OpenAI accepts only
+    ``image/png``, ``image/jpeg``, ``image/gif`` and ``image/webp`` and rejects
+    ``application/octet-stream`` outright, so an unlabeled local PNG would
+    otherwise fail every call.
+    """
+    import mimetypes
+
+    if not uri:
+        return None
+    guessed, _ = mimetypes.guess_type(str(uri), strict=False)
+    return guessed
+
+
 def _image_part(request: DescribeRequest) -> Optional[Dict[str, Any]]:
     """Build the ``image_url`` content part, fetching bytes only when needed.
 
@@ -130,7 +146,7 @@ def _image_part(request: DescribeRequest) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
 
-    mime = request.mime or "application/octet-stream"
+    mime = request.mime or _guess_mime(request.uri) or "application/octet-stream"
     encoded = base64.b64encode(raw).decode("ascii")
     return {
         "type": "image_url",
@@ -317,6 +333,7 @@ def _post_chat(
     Same return contract as ``local_llm._call_remote_llm_with_model`` so the
     retry decision above can be made on status alone.
     """
+    status: Optional[int] = None
     try:
         import httpx
         has_httpx = True
@@ -350,7 +367,7 @@ def _post_chat(
             except urllib.error.HTTPError as exc:
                 return (None, exc.code, exc)
             except Exception as exc:
-                return (None, None, exc)
+                return (None, status, exc)
 
         choices = data.get("choices", []) if isinstance(data, dict) else []
         if choices:
@@ -359,7 +376,7 @@ def _post_chat(
                 return (str(content), status, None)
         return (None, status, None)
     except Exception as exc:
-        return (None, None, exc)
+        return (None, status, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +450,7 @@ class OpenAICompatModalityBackend:
     """Describe content via any OpenAI-compatible vision endpoint."""
 
     name: str = NAME
-    modalities: FrozenSet[str] = frozenset({"image", "document"})
+    modalities: FrozenSet[str] = frozenset({"image", "audio"})
 
     def describe(self, request: DescribeRequest) -> Optional[DescribeResult]:
         base_url = _cfg_str("modality_base_url").rstrip("/")
@@ -447,6 +464,14 @@ class OpenAICompatModalityBackend:
                 "no modality model configured for %r; skipping", request.modality
             )
             return None
+
+        if str(request.modality).strip().lower() == "audio":
+            from mnemosyne.core.modality_openai_audio import describe_audio
+
+            request.timeout = float(request.timeout or _cfg_int("modality_timeout", 60))
+            request.max_moments = int(request.max_moments or _cfg_int("modality_max_moments", 12))
+            return describe_audio(request, base_url=base_url, api_key=api_key,
+                                  model=model, provider=self.name)
 
         part = _image_part(request)
         if part is None:
@@ -477,11 +502,15 @@ class OpenAICompatModalityBackend:
             text, status, exc = _post_chat(url, headers, payload, timeout)
             if text is not None:
                 break
-            transient = (
-                (status is not None and (status == 429 or 500 <= status < 600))
-                or (exc is not None and _is_rate_limit_error(exc))
-                or (status is None and exc is not None)
-            )
+            if status is None:
+                # No HTTP response was received, so this was a transport
+                # failure. Retry it regardless of how an exception is worded.
+                transient = exc is not None
+            else:
+                # A received HTTP status is authoritative. In particular, do
+                # not let an incidental "429" in the exception text turn a
+                # terminal client error into a retry.
+                transient = status == 429 or 500 <= status < 600
             if transient and attempt < _MAX_ATTEMPTS - 1:
                 time.sleep(_retry_delay(attempt))
                 continue

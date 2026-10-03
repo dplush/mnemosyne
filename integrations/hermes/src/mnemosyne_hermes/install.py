@@ -9,7 +9,9 @@ import importlib
 import json
 import logging
 import math
+import ntpath
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -19,7 +21,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
 PLUGIN_NAME = "mnemosyne"
@@ -27,6 +29,8 @@ DEFAULT_WRAPPER_IMPORT_TIMEOUT = 60.0
 SKILL_NAME = "mnemosyne-memory-override"
 SKILL_CATEGORY = "memory"
 BUNDLED_SKILL_RESOURCE = ("skills", SKILL_NAME, "SKILL.md")
+WRAPPER_MANIFEST_NAME = "mnemosyne-wrapper.json"
+PROFILE_LINKS_PREFERENCE_NAME = ".mnemosyne-profile-links.json"
 
 _MAX_HERMES_BIN_DEPTH = 10
 LOGGER = logging.getLogger(__name__)
@@ -87,6 +91,18 @@ class SkillInstallResult:
     message: str
 
 
+@dataclass(frozen=True)
+class HermesPathContract:
+    """Installer-owned plugin, profile-link, and skill paths in one Hermes home."""
+
+    hermes_home: Path
+    plugin_target: Path
+    wrapper_manifest: Path
+    profile_links_preference: Path
+    profile_plugin_targets: tuple[Path, ...]
+    skill_target: Path
+
+
 class _WindowsSymlinkPrivilegeError(RuntimeError):
     """A Windows symlink failure for which the CLI has a safe retry."""
 
@@ -141,6 +157,30 @@ def skill_target_file(hermes_home_path: str | Path | None = None) -> Path:
     """
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
     return base / "skills" / SKILL_CATEGORY / SKILL_NAME / "SKILL.md"
+
+
+def _wrapper_manifest_file(plugin_target: Path) -> Path:
+    """Return the wrapper marker/side-environment manifest for a plugin target."""
+    return plugin_target / WRAPPER_MANIFEST_NAME
+
+
+def hermes_path_contract(
+    hermes_home_path: str | Path | None = None,
+) -> HermesPathContract:
+    """Return the persistent path boundary owned by the Mnemosyne installer."""
+    base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
+    plugin_target = plugin_target_dir(base)
+    return HermesPathContract(
+        hermes_home=base,
+        plugin_target=plugin_target,
+        wrapper_manifest=_wrapper_manifest_file(plugin_target),
+        profile_links_preference=_profile_links_preference_path(base),
+        profile_plugin_targets=tuple(
+            profile / "plugins" / PLUGIN_NAME
+            for profile in _iter_mnemosyne_profiles(base)
+        ),
+        skill_target=skill_target_file(base),
+    )
 
 
 def bundled_skill_resource():
@@ -302,7 +342,7 @@ def _provider_init_is_mnemosyne(init_file: Path) -> bool:
         ):
             return False
 
-        wrapper_manifest = init_file.with_name("mnemosyne-wrapper.json")
+        wrapper_manifest = _wrapper_manifest_file(init_file.parent)
         if wrapper_manifest.is_file():
             metadata = _wrapper_metadata(init_file.parent, init_file)
             return (
@@ -349,7 +389,7 @@ def _extract_wrapper_metadata(init_file: Path) -> tuple[Path | None, Path | None
 
 def _wrapper_metadata(target: Path, init_file: Path) -> _WrapperMetadata:
     """Read wrapper metadata, using legacy assignments only when no manifest exists."""
-    manifest = target / "mnemosyne-wrapper.json"
+    manifest = _wrapper_manifest_file(target)
     try:
         if not manifest.exists():
             python, site_packages = _extract_wrapper_metadata(init_file)
@@ -469,6 +509,11 @@ def _check_wrapper_import(
         f"selected_site = Path({str(site_packages)!r}).resolve()\n"
         "site.addsitedir(str(selected_site))\n"
         "import mnemosyne_hermes\n"
+        # mnemosyne_hermes deliberately degrades when its optional core imports
+        # are unavailable. A wrapper needs the actual runtime, not merely that
+        # importable fallback package, so prove the same core entry point as the
+        # installer's CLI preflight in the selected interpreter.
+        "import mnemosyne.core.beam\n"
         "origin = getattr(mnemosyne_hermes, '__file__', None)\n"
         "if not origin:\n"
         "    raise SystemExit('mnemosyne_hermes package has no file origin')\n"
@@ -478,22 +523,26 @@ def _check_wrapper_import(
         + "print(getattr(mnemosyne_hermes, '__version__', 'unknown'))\n"
     )
     try:
-        result = subprocess.run(
-            [str(runner), "-S", "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=import_timeout,
-            # -S and a selected site directory isolate imports from the runner's
-            # ambient site/user directories. Filtering PYTHONPATH prevents a
-            # caller-controlled package shadowing that contract; filtering
-            # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
-            env={
-                key: value
-                for key, value in os.environ.items()
-                if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
-            },
-            cwd=site_packages,
-        )
+        # Python puts the subprocess working directory on sys.path.  Use a
+        # fresh empty directory so validation cannot borrow a checkout or the
+        # installer's current directory to satisfy the selected runtime.
+        with tempfile.TemporaryDirectory(prefix="mnemosyne-wrapper-import-") as probe_cwd:
+            result = subprocess.run(
+                [str(runner), "-S", "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=import_timeout,
+                # -S and a selected site directory isolate imports from the runner's
+                # ambient site/user directories. Filtering PYTHONPATH prevents a
+                # caller-controlled package shadowing that contract; filtering
+                # PYTHONOPTIMIZE keeps assertion elision from changing probe behavior.
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"PYTHONPATH", "PYTHONOPTIMIZE"}
+                },
+                cwd=probe_cwd,
+            )
     except OSError as exc:
         return False, f"could not run wrapper Python {runner}: {exc}", True
     except subprocess.TimeoutExpired:
@@ -503,10 +552,13 @@ def _check_wrapper_import(
     return False, (result.stderr.strip() or result.stdout.strip() or "import failed")[:500], False
 
 
-def _copy_plugin_yaml(target: Path) -> None:
+def _write_wrapper_plugin_yaml(target: Path) -> None:
+    """Write wrapper-only Hermes metadata without changing the package manifest."""
     source_yaml = _resolve_package_dir() / "plugin.yaml"
     if source_yaml.is_file():
-        shutil.copy2(source_yaml, target / "plugin.yaml")
+        manifest = source_yaml.read_text(encoding="utf-8")
+        manifest = manifest.rstrip("\n") + "\npython_runtime: external\n"
+        (target / "plugin.yaml").write_text(manifest, encoding="utf-8")
 
 
 def plugin_state(*, hermes_home_path: str | Path | None = None) -> PluginState:
@@ -862,6 +914,28 @@ def _is_windows_platform() -> bool:
     return os.name == "nt"
 
 
+DEFAULT_INSTALL_MODE_POSIX = "symlink"
+DEFAULT_INSTALL_MODE_WINDOWS = "wrapper"
+
+
+def default_install_mode() -> str:
+    """Return the install mode to use when the caller did not choose one.
+
+    Symlink mode is the historical default and stays the default everywhere it
+    can actually succeed. It cannot succeed on native Windows: creating a
+    symbolic link there requires ``SeCreateSymbolicLinkPrivilege``, which in
+    practice means Developer Mode is enabled or the shell is elevated. Without
+    one of those, ``os.symlink`` raises ``WinError 1314`` and the install fails.
+
+    That is why native Windows installs have been reported as working for some
+    people and not others: the outcome depends on a privilege nobody thinks to
+    check. Wrapper mode writes a real plugin directory and needs no privilege,
+    so it is the default there. An explicit ``--mode symlink`` still works for
+    anyone who does hold the privilege. See issue #857.
+    """
+    return DEFAULT_INSTALL_MODE_WINDOWS if _is_windows_platform() else DEFAULT_INSTALL_MODE_POSIX
+
+
 def _venv_python_candidates(venv_root: Path) -> tuple[Path, ...]:
     """Return supported interpreter paths in platform-appropriate order.
 
@@ -908,8 +982,100 @@ def _is_validated_venv_python(candidate: Path) -> bool:
     )
 
 
-def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[Path]:
-    """Try to find Hermes' python executable for dep validation.
+def _validate_explicit_python(explicit_python: str | Path | None) -> None:
+    """Reject a supplied --python value that names no interpreter."""
+    if explicit_python is not None and not str(explicit_python).strip():
+        raise ValueError(
+            "--python was given an empty value. Pass the path to Hermes' "
+            "interpreter, or omit --python to let the installer find it."
+        )
+
+
+# Returned by _staged_runtime_python() when Hermes has committed no staged
+# runtime for a checkout, so callers fall through to the checkout's own venv.
+_NOT_STAGED = object()
+
+
+def _hermes_install_key(project_root: Path) -> str:
+    """Return Hermes' PM state key for a checkout (``pm.environments.install_key``)."""
+    canonical = str(Path(project_root).resolve())
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _staged_runtime_python(project_root: Path, hermes_home_path: Path):
+    """Return the interpreter of the runtime Hermes committed for a checkout.
+
+    Hermes 0.21 keeps ``<checkout>/venv`` only as a macOS TCC anchor. The
+    provider executes from a staged generation,
+    ``<home>/installs/<key>/environments/<generation>/venv``, which Hermes' PM
+    selects through ``installs/<key>/facts.json`` (``packages.venv.environment``).
+    ``<key>`` is derived from the checkout path, so the active install is found
+    by construction: ``installs/`` is never scanned and no directory is chosen
+    among several. This mirrors ``pm.environments.selected_venv``; the installer
+    runs in its own venv and cannot import Hermes' ``pm`` package.
+
+    Returns ``_NOT_STAGED`` when nothing is committed for the checkout (no
+    record, or no recorded environment), which is what Hermes itself answers
+    with the checkout's own venv. Returns the interpreter when the recorded
+    generation is usable. Returns ``None`` when a record exists but cannot be
+    used (unreadable, outside this install's ``environments/``, or without an
+    executable interpreter): Hermes refuses to run then, and falling back to the
+    anchor would target an interpreter the provider never runs under (#1068).
+    The interpreter path stays under ``<home>``, unresolved, like the rest of
+    discovery.
+    """
+    facts = hermes_home_path / "installs" / _hermes_install_key(project_root) / "facts.json"
+
+    def unusable(reason: str) -> None:
+        LOGGER.warning(
+            "Hermes recorded a staged runtime in %s that cannot be used: %s. "
+            "Not falling back to the checkout's venv, which is not the runtime "
+            "Hermes executes. Pass --python to select the interpreter explicitly.",
+            facts,
+            reason,
+        )
+
+    try:
+        data = json.loads(facts.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return _NOT_STAGED
+    except (OSError, ValueError) as exc:
+        return unusable(f"it cannot be read ({exc})")
+    try:
+        recorded = data.get("packages", {}).get("venv", {}).get("environment")
+    except AttributeError:
+        return unusable("it has an unexpected structure")
+    if recorded is None:
+        return _NOT_STAGED
+    if not isinstance(recorded, str):
+        return unusable("the recorded environment is not a path")
+
+    generations = facts.parent / "environments"
+    try:
+        relative = Path(recorded).resolve().relative_to(generations.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return unusable(f"{recorded} is outside {generations}")
+    venv = generations / relative
+    for candidate in _venv_python_candidates(venv):
+        if _is_validated_venv_python(candidate):
+            return candidate
+    return unusable(f"{venv} has no executable interpreter in a virtual environment")
+
+
+def _find_hermes_python(
+    explicit_python: str | Path | None = None,
+    hermes_home_path: str | Path | None = None,
+) -> Optional[Path]:
+    """Try to find Hermes' Python executable for dependency validation.
+
+    ``hermes_home_path`` scopes known-root discovery to an explicit CLI home;
+    otherwise the configured default Hermes home is used.
+
+    On Hermes 0.21+ the checkout's venv is only a macOS TCC anchor and the
+    provider runs from a staged generation under ``<home>/installs/``. For a
+    checkout that has one, discovery returns that generation's interpreter, never
+    the anchor (see ``_staged_runtime_python``); checkouts without one keep the
+    venv-based discovery below.
 
     Returns None when no *validated* Hermes runtime is found. A candidate is
     never returned on the strength of sitting next to the launcher alone: the
@@ -933,64 +1099,65 @@ def _find_hermes_python(explicit_python: str | Path | None = None) -> Optional[P
     #    would answer with a different interpreter than the one the user asked
     #    for -- exactly the silent substitution this branch exists to prevent.
     if explicit_python is not None:
+        _validate_explicit_python(explicit_python)
         selected = str(explicit_python)
         # Strip only to decide whether anything was named. A POSIX path may
         # legitimately begin or end with whitespace, so stripping the value we
         # return would select a different interpreter than the one requested,
         # or fail to find it at all.
-        if not selected.strip():
-            raise ValueError(
-                "--python was given an empty value. Pass the path to Hermes' "
-                "interpreter, or omit --python to let the installer find it."
-            )
         return Path(selected).expanduser()
 
-    hermes_home_path = hermes_home()
+    scoped_home = hermes_home_path is not None
+    hermes_home_path = (
+        Path(hermes_home_path).expanduser()
+        if scoped_home
+        else hermes_home()
+    )
 
-    # 1. Resolve the `hermes` launcher on PATH back to its venv Python.
-    #    A pip/pipx-installed Hermes puts its console script next to the
-    #    interpreter that runs it, so the Python is a sibling of the resolved
-    #    binary. Covers the common /usr/local/lib/hermes-agent/venv layout that
-    #    the hardcoded roots below miss entirely (the silent-no-op that left
-    #    provider deps out of Hermes' actual venv and produced "loaded but no
-    #    provider instance found").
-    #
-    #    The sibling is only trusted when the directory it lives in is a real
-    #    venv. `_resolve_hermes_bin` follows symlinks and wrapper `exec` hops,
-    #    but a launcher that is neither -- a script that calls the real binary
-    #    as a subprocess, or a compiled shim with no `exec` line to read --
-    #    resolves to itself and leaves `bin_dir` as the shim directory. Without
-    #    this check `~/.local/bin/python` (commonly a Homebrew or system
-    #    symlink) gets `mnemosyne-hermes[all]` installed into it while the
-    #    installer reports success (#618). An unvalidated sibling is discarded
-    #    outright rather than kept as a fallback: the only layout it uniquely
-    #    covers is a non-venv system install, which is exactly where
-    #    bootstrapping does the most damage.
-    hermes_bin = shutil.which("hermes")
-    if hermes_bin:
-        resolved = _resolve_hermes_bin(hermes_bin)
-        if resolved:
-            for candidate in _venv_python_candidates(resolved.parent.parent):
-                if _is_validated_venv_python(candidate):
-                    return candidate
+    # An explicit --hermes-home is a discovery boundary. It must never bind the
+    # selected plugin home to a launcher, active venv, or global install that
+    # belongs to another Hermes deployment.
+    if not scoped_home:
+        # 1. Resolve the `hermes` launcher on PATH back to its venv Python.
+        # A pip/pipx-installed Hermes puts its console script next to the
+        # interpreter that runs it, so the Python is a sibling of the resolved
+        # binary. Covers the common /usr/local/lib/hermes-agent/venv layout that
+        # the hardcoded roots below miss entirely.
+        hermes_bin = shutil.which("hermes")
+        if hermes_bin:
+            resolved = _resolve_hermes_bin(hermes_bin)
+            if resolved:
+                if _is_venv_bin_dir(resolved.parent):
+                    staged = _staged_runtime_python(
+                        resolved.parent.parent.parent, hermes_home_path
+                    )
+                    if staged is not _NOT_STAGED:
+                        return staged
+                for candidate in _venv_python_candidates(resolved.parent.parent):
+                    if _is_validated_venv_python(candidate):
+                        return candidate
 
-    # 2. Check known hermes-agent checkout / install roots with a venv.
-    #    Held to the same bar as the launcher sibling above: a directory named
-    #    `venv` is not evidence that it is one. A half-removed environment, or
-    #    one whose base interpreter is gone, leaves `bin/python` in place with
-    #    no pyvenv.cfg beside it, and bootstrapping into that is the failure
-    #    this function exists to prevent.
-    for root in [
-        hermes_home_path / "hermes-agent",
-        Path.home() / "hermes-agent",
-        Path("/opt/hermes/hermes-agent"),
-        Path("/usr/local/lib/hermes-agent"),
-        Path("/usr/lib/hermes-agent"),
-    ]:
+    # Check the selected Hermes home first. With an explicit home it is the
+    # only permitted root; otherwise retain the established global fallbacks.
+    roots = [hermes_home_path / "hermes-agent"]
+    if not scoped_home:
+        roots.extend([
+            Path.home() / "hermes-agent",
+            Path("/opt/hermes/hermes-agent"),
+            Path("/usr/local/lib/hermes-agent"),
+            Path("/usr/lib/hermes-agent"),
+        ])
+    for root in roots:
+        staged = _staged_runtime_python(root, hermes_home_path)
+        if staged is not _NOT_STAGED:
+            return staged
         for venv_name in ("venv", ".venv"):
             for candidate in _venv_python_candidates(root / venv_name):
                 if _is_validated_venv_python(candidate):
                     return candidate
+
+    if scoped_home:
+        return None
 
     # 3. Check if we're running inside Hermes' venv ourselves.
     #    `sys.prefix != sys.base_prefix` says the *running* interpreter is in a
@@ -1048,7 +1215,7 @@ def check_mnemosyne_core() -> bool:
 
 
 def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]:
-    """Check if Hermes' Python can import mnemosyne core.
+    """Check if Hermes' Python can import Mnemosyne's operational dependencies.
 
     Returns the version string if importable, None otherwise.
     """
@@ -1056,7 +1223,7 @@ def check_mnemosyne_core_for_hermes_python(hermes_python: Path) -> Optional[str]
         result = subprocess.run(
             [str(hermes_python), "-c",
              "import mnemosyne; print(mnemosyne.__version__); "
-             "import sqlite_vec"],
+             "import mnemosyne.core.beam; import sqlite_vec"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
@@ -1208,7 +1375,7 @@ def _link_all_profiles(
 def _profile_links_preference_path(hermes_home_path: str | Path | None = None) -> Path:
     """Return the installer-managed profile-link preference for a Hermes home."""
     base = Path(hermes_home_path).expanduser() if hermes_home_path else hermes_home()
-    return base / "plugins" / ".mnemosyne-profile-links.json"
+    return base / "plugins" / PROFILE_LINKS_PREFERENCE_NAME
 
 
 def _atomic_write_profile_links_preference(path: Path, payload: bytes) -> None:
@@ -1508,10 +1675,53 @@ def _is_wrapper_plugin_target(target: Path) -> bool:
     """Return whether ``target`` is a generated Mnemosyne wrapper directory."""
     if target.is_symlink() or not target.is_dir():
         return False
-    if (target / "mnemosyne-wrapper.json").exists():
+    if _wrapper_manifest_file(target).exists():
         return True
     python, site_packages = _extract_wrapper_metadata(target / "__init__.py")
     return python is not None or site_packages is not None
+
+
+def _hermes_pm_generation_target(python: str | Path, home: str | Path) -> bool:
+    """Recognize the lexical PM layout without resolving venv Python symlinks.
+
+    This is a diagnostic, not proof that other paths persist: filesystem aliases
+    and unrecognized installation layouts are outside its scope.
+    """
+    selected, base = str(python), str(home)
+    windows = bool(ntpath.splitdrive(selected)[0] or ntpath.splitdrive(base)[0])
+    if windows:
+        path = PureWindowsPath(ntpath.normpath(selected))
+        root = PureWindowsPath(ntpath.normpath(base))
+        same = lambda a, b: a.casefold() == b.casefold()
+    else:
+        path = PurePosixPath(posixpath.abspath(selected))
+        root = PurePosixPath(posixpath.abspath(base))
+        same = lambda a, b: a == b
+    prefix = (*root.parts, "installs")
+    parts = path.parts
+    if len(parts) != len(prefix) + 6 or not all(
+        same(a, b) for a, b in zip(parts, prefix)
+    ):
+        return False
+    relative = parts[len(prefix):]
+    return (
+        same(relative[1], "environments")
+        and same(relative[3], "venv")
+        and tuple(part.casefold() for part in relative[4:])
+        in {("bin", "python"), ("bin", "python3"), ("scripts", "python.exe")}
+    )
+
+
+def _pm_wrapper_warning(python: str | Path | None, home: str | Path) -> str | None:
+    if python is None or not _hermes_pm_generation_target(python, home):
+        return None
+    return (
+        f"⚠ Wrapper Python {python} appears to be inside a replaceable Hermes "
+        "PM generation. This wrapper may stop working after a Hermes update. "
+        "For persistence, install Mnemosyne in a side venv outside installs/ "
+        "and re-register with --mode wrapper --force --python <side-venv-python>. "
+        "Existing wrapper registration remains supported."
+    )
 
 
 def _validated_wrapper_environment(
@@ -1520,7 +1730,21 @@ def _validated_wrapper_environment(
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
 ) -> tuple[Path, Path]:
     """Validate the selected wrapper runtime before touching an installed plugin."""
-    wrapper_python = Path(python).expanduser() if python else Path(sys.executable)
+    if python is None:
+        wrapper_python = Path(sys.executable)
+    else:
+        selected = str(python)
+        if not selected.strip():
+            raise ValueError(
+                "--python was given an empty value. Pass the path to Hermes' "
+                "interpreter, or omit --python to let the installer find it."
+            )
+        # The import probe runs from an isolated temporary working directory.
+        # Make an explicit relative path independent of that cwd before either
+        # validation or the probe uses it.  ``absolute()`` is lexical here:
+        # ``resolve()`` would follow a venv's bin/python symlink to its base
+        # interpreter and lose the selected virtual environment.
+        wrapper_python = Path(selected).expanduser().absolute()
     if not wrapper_python.is_file():
         raise FileNotFoundError(f"Python interpreter not found: {wrapper_python}")
     import_timeout = _validated_import_timeout(import_timeout)
@@ -1530,7 +1754,8 @@ def _validated_wrapper_environment(
     )
     if not import_ok:
         raise RuntimeError(
-            f"Selected Python environment cannot import mnemosyne_hermes: {import_error}"
+            "Selected Python environment cannot import required mnemosyne core "
+            f"(mnemosyne.core.beam): {import_error}"
         )
     return wrapper_python, site_packages
 
@@ -1651,7 +1876,7 @@ def _guard_selected_site_packages_python_compatibility(selected_site_packages: P
 
 def activate() -> dict[str, object]:
     \"\"\"Validate the wrapper and import its selected package identity.\"\"\"
-    manifest_path = Path(__file__).with_name("mnemosyne-wrapper.json")
+    manifest_path = Path(__file__).with_name(__MNEMOSYNE_WRAPPER_MANIFEST_NAME__)
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -1719,7 +1944,7 @@ def activate() -> dict[str, object]:
     if expected_root is not None and not from_selected_package(selected_package):
         raise RuntimeError("Mnemosyne wrapper imported package from an unexpected origin")
     return manifest
-"""
+""".replace("__MNEMOSYNE_WRAPPER_MANIFEST_NAME__", repr(WRAPPER_MANIFEST_NAME))
     init_source = """\"\"\"Persistent Mnemosyne Hermes plugin wrapper.\"\"\"
 from ._mnemosyne_bootstrap import activate as _activate
 
@@ -1746,21 +1971,21 @@ _activate()
 
 from mnemosyne_hermes.cli import *  # noqa: F401,F403,E402
 """
-    (target / "mnemosyne-wrapper.json").write_text(
+    _wrapper_manifest_file(target).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     (target / "_mnemosyne_bootstrap.py").write_text(bootstrap_source, encoding="utf-8")
     (target / "__init__.py").write_text(init_source, encoding="utf-8")
     (target / "cli.py").write_text(cli_source, encoding="utf-8")
-    _copy_plugin_yaml(target)
+    _write_wrapper_plugin_yaml(target)
 
 
 def install_plugin(
     *,
     hermes_home_path: str | Path | None = None,
     force: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
@@ -1776,6 +2001,8 @@ def install_plugin(
     opted-in profile fan-out by default; set it False to install only at the
     selected Hermes home.
     """
+    if mode is None:
+        mode = default_install_mode()
     if mode not in {"symlink", "wrapper"}:
         raise ValueError("mode must be 'symlink' or 'wrapper'")
     if migrate_wrapper_to_symlink and (mode != "symlink" or not force):
@@ -1868,6 +2095,9 @@ def install_plugin(
     wrapper_python, site_packages = _validated_wrapper_environment(
         python, import_timeout=import_timeout
     )
+    warning = _pm_wrapper_warning(wrapper_python, base)
+    if warning:
+        print(f"  {warning}", file=sys.stderr)
     target.parent.mkdir(parents=True, exist_ok=True)
     staging_parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
     staged = staging_parent / target.name
@@ -1990,45 +2220,6 @@ def cleanup_plugin(
     return actions
 
 
-def _do_upgrade(*, force: bool = True, hermes_home_path: str | Path | None = None) -> bool:
-    """Run pipx upgrade mnemosyne-hermes then install --force."""
-    import subprocess as _sp
-
-    print("  Upgrading mnemosyne-hermes via pipx...")
-    try:
-        result = _sp.run(
-            ["pipx", "upgrade", "mnemosyne-hermes"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.strip()[:300]
-            if "not installed" in stderr:
-                print("  ⚠ mnemosyne-hermes not installed via pipx. Install it first:")
-                print("     pipx install mnemosyne-hermes")
-                return False
-            print(f"  ⚠ pipx upgrade failed: {stderr}")
-            # Continue anyway -- maybe the user installed via pip directly
-            print("  Continuing with re-install...")
-        else:
-            out = result.stdout.strip()[:200]
-            if out:
-                print(f"  {out}")
-    except FileNotFoundError:
-        print("  ⚠ pipx not found. Install it: pip install pipx")
-        return False
-
-    # Now re-install the plugin symlink
-    print("  Re-installing plugin symlink...")
-    try:
-        target = install_plugin(hermes_home_path=hermes_home_path, force=force)
-        print(f"  Installed. Symlink at {target}")
-        print(f"    -> {os.readlink(str(target))}")
-        return True
-    except Exception as exc:
-        print(f"  ⚠ Re-install failed: {exc}")
-        return False
-
-
 def is_installed(*, hermes_home_path: str | Path | None = None) -> bool:
     """Return whether the Mnemosyne provider is installed for Hermes discovery."""
     return plugin_state(hermes_home_path=hermes_home_path).installed
@@ -2040,6 +2231,80 @@ def _distribution_version(distribution: str) -> str:
         return importlib.metadata.version(distribution)
     except importlib.metadata.PackageNotFoundError:
         return "unavailable"
+
+
+def _runtime_python_json_error(message: str) -> int:
+    """Print a runtime Python error using the command's JSON contract."""
+    print(json.dumps({"ok": False, "error": message}))
+    return 1
+
+
+def _runtime_python_json(
+    explicit_python: str | Path | None = None,
+    hermes_home_path: str | Path | None = None,
+) -> int:
+    """Print the selected Hermes interpreter and version as JSON."""
+    try:
+        python = _find_hermes_python(
+            explicit_python=explicit_python,
+            hermes_home_path=hermes_home_path,
+        )
+    except ValueError as exc:
+        return _runtime_python_json_error(str(exc))
+
+    if python is None:
+        return _runtime_python_json_error(
+            "Could not identify Hermes' Python. Pass --python "
+            "/path/to/hermes/venv/bin/python."
+        )
+    if not python.is_file() or not os.access(python, os.X_OK):
+        return _runtime_python_json_error(
+            f"Selected Python is not an executable file: {python}"
+        )
+
+    try:
+        result = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                (
+                    "import json, platform; "
+                    "print(json.dumps({'runtime': 'python', "
+                    "'version': platform.python_version()}))"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _runtime_python_json_error(f"Could not run selected Python at {python}: {exc}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = None
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if (
+        result.returncode != 0
+        or not isinstance(payload, dict)
+        or payload.get("runtime") != "python"
+        or not isinstance(version, str)
+        or not version
+    ):
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        if result.returncode == 0 and not result.stderr.strip():
+            detail = "unexpected runtime probe response"
+        return _runtime_python_json_error(
+            f"Could not read Python version from {python}: {detail}"
+        )
+
+    print(json.dumps({"ok": True, "python": str(python), "version": version}))
+    return 0
 
 
 
@@ -2081,8 +2346,12 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--mode",
         choices=("symlink", "wrapper"),
-        default="symlink",
-        help="Install mode: symlink (default) or persistent wrapper shim.",
+        default=None,
+        help=(
+            "Install mode. Defaults to symlink, except on native Windows where "
+            "it defaults to the persistent wrapper shim because symbolic links "
+            "there require Developer Mode or an elevated shell."
+        ),
     )
     install.add_argument(
         "--python",
@@ -2127,6 +2396,20 @@ def _parser() -> argparse.ArgumentParser:
         help="Show whether Mnemosyne is installed for Hermes memory discovery.",
     )
     subparsers.add_parser("version", help="Show installed package versions.")
+    runtime_python = subparsers.add_parser(
+        "runtime-python",
+        help="Report the Python interpreter selected for Hermes.",
+    )
+    runtime_python.add_argument(
+        "--json",
+        action="store_true",
+        required=True,
+        help="Emit the selected interpreter and version as JSON.",
+    )
+    runtime_python.add_argument(
+        "--python",
+        help="Explicit Hermes Python interpreter; bypasses automatic discovery.",
+    )
     cleanup = subparsers.add_parser(
         "cleanup",
         help="Remove all traces of Mnemosyne from Hermes plugin directory (safe, never touches database).",
@@ -2153,7 +2436,7 @@ def run_install(
     force: bool = False,
     hermes_home_path: str | Path | None = None,
     no_bootstrap: bool = False,
-    mode: str = "symlink",
+    mode: str | None = None,
     python: str | Path | None = None,
     import_timeout: float = DEFAULT_WRAPPER_IMPORT_TIMEOUT,
     migrate_wrapper_to_symlink: bool = False,
@@ -2165,9 +2448,18 @@ def run_install(
     Can be called from the CLI ``install`` subcommand or programmatically
     (e.g., from ``upgrade.py`` after upgrading the pip package).
     """
-    # Check core library first (installer's own Python)
-    core_ok = check_mnemosyne_core()
-    if not core_ok:
+    if mode is None:
+        mode = default_install_mode()
+
+    # Validate supplied input before the symlink-mode installer preflight. A
+    # blank value is explicit, not an omitted --python request, and must never
+    # be hidden by an earlier preflight return.
+    _validate_explicit_python(python)
+
+    # Wrapper validation belongs to its selected environment, including the
+    # interpreter discovered when --python is omitted. Only symlink installs
+    # retain the installer-Python core preflight and bootstrap path.
+    if mode == "symlink" and not check_mnemosyne_core():
         print(
             "  mnemosyne-memory NOT found in this Python. Install it first:\n"
             "    pip install mnemosyne-hermes[all]",
@@ -2175,9 +2467,21 @@ def run_install(
         )
         return 1
 
-    # Symlink installs need Hermes' own Python to contain the package. Wrapper
-    # installs validate the explicitly selected interpreter in install_plugin().
-    hermes_python = _find_hermes_python(explicit_python=python) if mode == "symlink" else None
+    # Both install modes need a Hermes interpreter. Symlink installs bootstrap
+    # it when needed; wrapper installs validate it and record its metadata. An
+    # explicit --python remains authoritative through _find_hermes_python().
+    hermes_python = _find_hermes_python(
+        explicit_python=python,
+        hermes_home_path=hermes_home_path,
+    )
+    if mode == "wrapper" and hermes_python is None:
+        print(
+            "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
+            "     Pass --python /path/to/hermes/venv/bin/python to select the "
+            "environment the wrapper must import from.",
+            file=sys.stderr,
+        )
+        return 1
     if mode == "symlink" and hermes_python is None:
         # Discovery found no validated Hermes runtime, so there is nothing safe
         # to bootstrap into. Before #618 this path guessed at the launcher's
@@ -2203,7 +2507,7 @@ def run_install(
     # to its base interpreter, so resolving both sides reports a venv and the
     # base install as the same runtime and skips the check that bootstraps
     # Hermes' venv (#618).
-    if hermes_python and hermes_python != Path(sys.executable):
+    if mode == "symlink" and hermes_python and hermes_python != Path(sys.executable):
         hermes_core = check_mnemosyne_core_for_hermes_python(hermes_python)
         if hermes_core is None:
             print(f"\n  ⚠ Hermes' Python at {hermes_python} can't import mnemosyne core.")
@@ -2232,7 +2536,7 @@ def run_install(
             hermes_home_path=hermes_home_path,
             force=force,
             mode=mode,
-            python=python,
+            python=hermes_python if mode == "wrapper" else python,
             import_timeout=import_timeout,
             migrate_wrapper_to_symlink=migrate_wrapper_to_symlink,
             link_profiles=link_profiles,
@@ -2240,9 +2544,11 @@ def run_install(
     except _WindowsSymlinkPrivilegeError:
         print(
             "\n  ⚠ Windows symbolic-link privilege is unavailable (WinError 1314).\n"
-            "     Enable Developer Mode or run with an account granted the "
-            "symbolic-link privilege.\n"
-            "     The installer did not switch install modes automatically.\n",
+            "     Symlink mode was requested explicitly, so the installer did not\n"
+            "     switch modes on your behalf. Either enable Developer Mode or run\n"
+            "     with an account granted the symbolic-link privilege, or install in\n"
+            "     persistent wrapper mode, which needs no privilege and is the\n"
+            "     default on Windows when no mode is given.\n",
             file=sys.stderr,
         )
         if hermes_python is not None:
@@ -2293,10 +2599,31 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if command == "install":
+            # argparse leaves --mode as None when the user did not choose one, so
+            # resolve it here, before anything reads it. Every downstream path
+            # (dry-run reporting included) then sees a concrete mode.
+            if getattr(args, "mode", None) is None:
+                args.mode = default_install_mode()
+                if args.mode == DEFAULT_INSTALL_MODE_WINDOWS and _is_windows_platform():
+                    print(
+                        "  Native Windows detected: installing in persistent wrapper mode.\n"
+                        "  Symbolic links need Developer Mode or an elevated shell here, so\n"
+                        "  wrapper mode is the default. Pass --mode symlink to override."
+                    )
+
             # Dry-run: just show what would happen
             hermes_python = _find_hermes_python(
-                explicit_python=getattr(args, "python", None)
+                explicit_python=getattr(args, "python", None),
+                hermes_home_path=args.hermes_home,
             )
+            if args.mode == "wrapper" and hermes_python is None:
+                print(
+                    "\n  ⚠ Could not identify Hermes' Python for wrapper mode.\n"
+                    "     Pass --python /path/to/hermes/venv/bin/python to select "
+                    "the environment the wrapper must import from.",
+                    file=sys.stderr,
+                )
+                return 1
             target = plugin_target_dir(args.hermes_home)
             if getattr(args, "dry_run", False):
                 invalid_wrapper_migration_args = (
@@ -2327,8 +2654,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  Skill state: {skill.status}")
                 print(f"  Skill action: {skill_plan.message}")
                 if getattr(args, "mode", "symlink") == "wrapper":
-                    wrapper_python = Path(getattr(args, "python", None) or sys.executable).expanduser()
+                    # Match run_install(): wrapper metadata and validation use
+                    # the discovered Hermes runtime unless --python selected one.
+                    # Preserve a venv's python symlink; absolute() is lexical.
+                    assert hermes_python is not None
+                    wrapper_python = hermes_python.absolute()
                     print(f"  Wrapper Python: {wrapper_python}")
+                    warning = _pm_wrapper_warning(wrapper_python, args.hermes_home or hermes_home())
+                    if warning:
+                        print(f"  {warning}")
                     if wrapper_python.is_file():
                         print(
                             "  Wrapper site-packages: "
@@ -2377,11 +2711,15 @@ def main(argv: list[str] | None = None) -> int:
             state = plugin_state(hermes_home_path=args.hermes_home)
             target = state.target
             installed = state.installed
-            hermes_python = _find_hermes_python()
+            hermes_python = _find_hermes_python(hermes_home_path=args.hermes_home)
             print("Status for mnemosyne-hermes plugin")
             print(f"  Plugin path: {target}")
             print(f"  State: {state.status}")
             print(f"  Mode: {state.mode}")
+            if state.mode == "wrapper":
+                warning = _pm_wrapper_warning(state.wrapper_python, args.hermes_home or hermes_home())
+                if warning:
+                    print(f"  {warning}")
             if installed:
                 if state.mode == "symlink" and state.link_target is not None:
                     print(f"  Target: {state.link_target}")
@@ -2432,6 +2770,12 @@ def main(argv: list[str] | None = None) -> int:
                 print("     may not be able to import mnemosyne core. Run with --dry-run to diagnose.")
             return 0 if installed else 1
 
+        if command == "runtime-python":
+            return _runtime_python_json(
+                explicit_python=args.python,
+                hermes_home_path=args.hermes_home,
+            )
+
         if command == "cleanup":
             dry_run = getattr(args, "dry_run", False)
             mode = " (dry-run)" if dry_run else ""
@@ -2447,7 +2791,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if command == "upgrade":
-            from mnemosyne_hermes.upgrade import upgrade_command
+            from mnemosyne.upgrade_hermes import upgrade_command
             return upgrade_command(args)
 
     except Exception as exc:

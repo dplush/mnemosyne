@@ -44,6 +44,11 @@ This release also changes Hermes wrapper install behavior. See
   media, describes it through a configured provider, and writes the description
   back as an ordinary memory that hybrid recall already understands. Text
   recall is unchanged.
+- **MCP Streamable HTTP transport.** `mnemosyne mcp` gains
+  `--transport streamable-http` (alias `http`). The MCP extras now require
+  `mcp>=2.0.0`; the lockfile previously resolved 1.28.1. If your environment
+  pins the MCP SDK transitively, relax a `mcp<2` constraint or move to 2.0.0
+  or newer before upgrading.
 - **Unknown embedding models now fail loud** instead of silently resolving to
   384 dimensions. This is the breaking change.
 
@@ -304,7 +309,7 @@ Not recommended for shared/multi-app systems.
 **Solution 4: Source install with editable mode**
 
 ```bash
-git clone https://github.com/AxDSan/mnemosyne.git
+git clone https://github.com/mnemosyne-oss/mnemosyne.git
 cd mnemosyne
 pip install -e . --break-system-packages
 ```
@@ -940,7 +945,7 @@ hermes memory status
 PyPI does not serve individual files at browsable URLs. The file is
 available at the GitHub repo:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 ### Option B: Source install (`pip install -e .`)
 
@@ -1148,7 +1153,7 @@ hermes mnemosyne import --input ~/backup.json
 PyPI does not serve individual package files at browsable URLs.
 The correct URL for the latest version is:
 
-  https://github.com/AxDSan/mnemosyne/blob/main/UPDATING.md
+  https://github.com/mnemosyne-oss/mnemosyne/blob/main/UPDATING.md
 
 The file IS included in the sdist and wheel — `pip show -f
 mnemosyne-memory` will confirm it ships.

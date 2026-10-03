@@ -99,6 +99,42 @@ class TestScoreNoise:
         assert score >= 0.7
         assert "terminal_output" in reasons or "noise_pattern_match" in reasons
 
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            # A real note: "total" and "installing" mid-sentence, a bullet that
+            # starts with "Total", and "subtotal" (#1074).
+            "# Genova Walking Tour\n\nMeet at the old port at 9:00. In total the "
+            "walk takes about three hours.\nTotal distance: 6 km, mostly flat.\n"
+            "After installing the offline map, follow the coast.\n",
+            "Trip budget\nSubtotal 48 euros for the tickets.\nTotal 48 euros for tickets.",
+            "Reminder: the tour is installing new signage all week.",
+        ],
+    )
+    def test_prose_with_total_or_installing_is_not_terminal_output(self, prose):
+        score, reasons = _score_noise(prose, 0.5, "")
+        assert "terminal_output" not in reasons
+        assert score < 0.8
+        assert _suggest_action(score, []) == "keep"
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            # ls -l block summary, plain and human-readable, mid-content and CRLF.
+            "Listing of the folder:\ntotal 48\nreadme.md\nnotes.txt",
+            "Listing of the folder:\ntotal 4.0K\nnotes.txt",
+            "Listing:\r\n total 48 \r\nnotes.txt",
+            # pip and brew installer lines, without any other terminal marker.
+            "Build log:\nInstalling collected packages: requests, urllib3",
+            "Build log:\n  Installing collected packages: requests",
+            "Build log:\n==> Installing ripgrep",
+        ],
+    )
+    def test_terminal_shaped_total_and_installing_still_flagged(self, output):
+        score, reasons = _score_noise(output, 0.5, "")
+        assert reasons == ["terminal_output"]
+        assert score == 0.85
+
     def test_stack_trace(self):
         content = "Traceback (most recent call last):\n  File \"test.py\", line 10"
         score, reasons = _score_noise(content, 0.5, "")
@@ -913,7 +949,12 @@ class TestAuditNoise:
         assert connection is not None
         with pytest.raises(sqlite3.ProgrammingError):
             connection.execute("SELECT 1")
-        assert "hygiene read failed" in capsys.readouterr().err
+        expected_code = (
+            "hygiene_audit_failed"
+            if function_name == "audit_noise"
+            else "hygiene_status_failed"
+        )
+        assert capsys.readouterr().err == f"Error: {expected_code}\n"
 
     @pytest.mark.parametrize("command_args", [["audit"], ["status"]])
     def test_cmd_hygiene_read_commands_report_readonly_open_errors(
@@ -931,7 +972,7 @@ class TestAuditNoise:
         with pytest.raises(SystemExit):
             cmd_hygiene(command_args)
 
-        assert "readonly connection failed" in capsys.readouterr().err
+        assert capsys.readouterr().err == f"Error: hygiene_{command_args[0]}_failed\n"
 
     def test_noise_summary_is_pii_safe(self, temp_db):
         db_path, beam = temp_db
@@ -1200,7 +1241,7 @@ def test_hygiene_suite_does_not_leak_config_into_subagent_provider(tmp_path, mon
     process: the autouse cleanup must discard that singleton before a subagent
     provider resolves its temporary data-directory configuration.
     """
-    from conftest import _close_cached_connections
+    from tests.conftest import _close_cached_connections
     from hermes_memory_provider import MnemosyneMemoryProvider
     from mnemosyne.core.config import MnemosyneConfig
 
