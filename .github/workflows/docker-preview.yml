@@ -1,0 +1,128 @@
+# Fork-only preparation. Tests run by default; publishing requires two opt-ins.
+name: Docker Hub preview (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish tested preview images (requires repository activation)
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: dockerhub-preview-${{ github.repository }}-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  DOCKERHUB_USERNAME: ddplush
+  PREVIEW_SHA: ${{ github.sha }}
+jobs:
+  build-and-test:
+    if: github.repository == 'dplush/mnemosyne'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Validate dispatched source
+        run: |
+          test "$(git rev-parse HEAD)" = "$PREVIEW_SHA"
+          python deploy/docker/preview.py metadata --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME"
+      - name: Install test tools
+        run: pip install -e '.[test,mcp]' -c deploy/docker/requirements.lock
+      - name: Build native source image
+        env:
+          ARCH: ${{ matrix.architecture }}
+        run: |
+          VERSION=$(python -c 'from importlib.metadata import version; print(version("mnemosyne-memory"))')
+          docker build --build-arg VERSION="$VERSION" --build-arg REVISION="$PREVIEW_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.description=Unofficial community preview from $GITHUB_REPOSITORY" \
+            -t "mnemosyne-mcp:preview-$ARCH" .
+          docker image inspect "mnemosyne-mcp:preview-$ARCH" > "$RUNNER_TEMP/inspect.json"
+          python deploy/docker/preview.py verify --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME" --architecture "$ARCH" --inspect-file "$RUNNER_TEMP/inspect.json"
+      - name: Verify MCP and preview gates
+        run: python -m pytest tests/test_docker_shared_mcp.py tests/test_docker_release.py tests/test_docker_acceptance_gates.py tests/test_docker_preview.py tests/test_mcp_streamable_http.py tests/test_multi_agent_identity.py tests/test_s1_mcp_sse_auth.py -q
+      - name: Verify native deployment
+        env:
+          ARCH: ${{ matrix.architecture }}
+        run: python -m pytest tests/docker/test_deployment.py --image "mnemosyne-mcp:preview-$ARCH" -v
+      - name: Export tested image
+        if: inputs.publish && vars.MNEMOSYNE_DOCKERHUB_PREVIEW_ENABLED == 'true'
+        env:
+          ARCH: ${{ matrix.architecture }}
+        run: docker save "mnemosyne-mcp:preview-$ARCH" -o "$RUNNER_TEMP/image.tar"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: inputs.publish && vars.MNEMOSYNE_DOCKERHUB_PREVIEW_ENABLED == 'true'
+        with:
+          name: preview-${{ github.sha }}-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/image.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+  publish:
+    needs: build-and-test
+    if: github.repository == 'dplush/mnemosyne' && inputs.publish && vars.MNEMOSYNE_DOCKERHUB_PREVIEW_ENABLED == 'true'
+    environment: dockerhub-preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: preview-${{ github.sha }}-*
+          path: ${{ runner.temp }}/tested-images
+      - name: Validate both tested artifacts before login
+        run: |
+          python deploy/docker/preview.py metadata --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME" > "$RUNNER_TEMP/preview.json"
+          python - <<'PY'
+          import json, os
+          with open(os.environ['RUNNER_TEMP'] + '/preview.json') as f:
+              meta = json.load(f)
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write('PREVIEW_IMAGE=' + meta['image'] + '\nPREVIEW_TAG=' + meta['tag'] + '\n')
+          PY
+          for arch in amd64 arm64; do
+            docker load -i "$RUNNER_TEMP/tested-images/preview-$PREVIEW_SHA-$arch/image.tar"
+            docker image inspect "mnemosyne-mcp:preview-$arch" > "$RUNNER_TEMP/inspect-$arch.json"
+            python deploy/docker/preview.py verify --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME" --architecture "$arch" --inspect-file "$RUNNER_TEMP/inspect-$arch.json"
+          done
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: docker.io
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push tested images and assemble preview manifest
+        run: |
+          refs=()
+          for arch in amd64 arm64; do
+            remote="$PREVIEW_IMAGE:$PREVIEW_TAG-$arch"
+            docker tag "mnemosyne-mcp:preview-$arch" "$remote"
+            docker push "$remote"
+            docker image inspect "$remote" > "$RUNNER_TEMP/pushed-$arch.json"
+            digest=$(python deploy/docker/preview.py digest --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME" --inspect-file "$RUNNER_TEMP/pushed-$arch.json")
+            refs+=("$digest")
+          done
+          docker buildx imagetools create -t "$PREVIEW_IMAGE:$PREVIEW_TAG" "${refs[@]}"
+          docker buildx imagetools inspect "$PREVIEW_IMAGE:$PREVIEW_TAG" >> "$GITHUB_STEP_SUMMARY"
