@@ -4476,9 +4476,9 @@ def _backfill_vec_working_from_memory_embeddings(conn: sqlite3.Connection) -> in
         WHERE vw.rowid IS NULL
     """).fetchall()
     inserted = 0
-    for row in rows:
-        embedding = json.loads(row["embedding_json"])
-        _vec_table_insert(conn, "vec_working", int(row["rowid"]), embedding)
+    for _wm_id, wm_rowid, embedding_json in rows:
+        embedding = json.loads(embedding_json)
+        _vec_table_insert(conn, "vec_working", int(wm_rowid), embedding)
         inserted += 1
     return inserted
 
@@ -13552,24 +13552,27 @@ class BeamMemory:
                     lines = compression_plugin.compress_lines(lines)
 
                 chunks = local_llm.chunk_memories_by_budget(lines, source=source)
-                if chunks:
+                if chunks and sum(len(chunk) for chunk in chunks) == len(lines):
                     invalid_reasoning = False
                     if len(chunks) == 1:
                         # All memories fit in one prompt.
                         summary = local_llm._summarize_memories(chunks[0], source=source)
                         invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
                     else:
-                        # Multi-chunk: any malformed trace invalidates the
-                        # complete LLM result instead of silently dropping it.
+                        # Every chunk must succeed; otherwise fall back over
+                        # the complete lines list instead of publishing a subset.
                         chunk_summaries = []
+                        incomplete_summary = False
                         for chunk in chunks:
                             chunk_summary = local_llm._summarize_memories(chunk, source=source)
                             if local_llm._is_invalid_reasoning_output(chunk_summary):
                                 invalid_reasoning = True
                                 break
-                            if chunk_summary:
-                                chunk_summaries.append(chunk_summary)
-                        if not invalid_reasoning and chunk_summaries:
+                            if not chunk_summary:
+                                incomplete_summary = True
+                                break
+                            chunk_summaries.append(chunk_summary)
+                        if not invalid_reasoning and not incomplete_summary and chunk_summaries:
                             # Second-pass: summarize the chunk summaries.
                             if len(chunk_summaries) == 1:
                                 summary = chunk_summaries[0]
@@ -13579,9 +13582,8 @@ class BeamMemory:
                                     source=f"{source} (consolidated)",
                                 )
                                 invalid_reasoning = local_llm._is_invalid_reasoning_output(summary)
-                                # Preserve the existing non-reasoning fallback.
-                                if not invalid_reasoning and not summary:
-                                    summary = " | ".join(chunk_summaries)
+                                # A failed merge leaves summary unset: the
+                                # complete-input AAAK fallback below owns recovery.
                     if invalid_reasoning:
                         logger.warning(
                             "sleep: malformed reasoning trace for source=%r (items=%d) "
@@ -13998,10 +14000,15 @@ class BeamMemory:
         Confirmation is LLM-backed via `validate_conflict_pair` only when
         `MNEMOSYNE_LLM_CONFLICT_DETECTION` is on *and* this is an explicit apply
         (`dry_run=False`). A dry run is deterministic by default (no LLM calls,
-        no mutation), but can opt into the same LLM vetting — still without
-        mutating — by passing `llm_eval=True`, so the reported parity with an
-        apply (which pairs the LLM would confirm vs. reject) can be tested
-        first. A dry run without `llm_eval` only reports detector candidates.
+        no memory supersession). Passing `llm_eval=True` invokes LLM vetting
+        and can write cost records, but still never supersedes memories. Both
+        modes return aggregate counters, not pair identities, similarity scores
+        or individual verdicts. `pairs_flagged` counts detector pairs;
+        `conflicts_resolved` counts the pairs this preview would supersede;
+        `llm_validations` counts validator invocations, including attempts with
+        no usable response. Zero confirmations do not by themselves establish
+        successful negative model verdicts. A later apply can observe different
+        database state or model responses.
         `min_gap_hours` relaxes the intra-conversation back-to-back heuristic
         for independent threads (default 0).
 
@@ -14153,8 +14160,8 @@ class BeamMemory:
                 confirmed = True
                 # LLM confirmation runs on an explicit apply when the env flag
                 # is on; a dry run is deterministic by default but can opt into
-                # the same LLM vetting (no mutation) via llm_eval=True, so the
-                # reported parity with an apply can be tested first.
+                # LLM vetting via llm_eval=True. The preview reports aggregate
+                # counts without superseding memory; validation can log costs.
                 run_llm = LLM_CONFLICT_DETECTION_ENABLED and not dry_run
                 if dry_run and llm_eval:
                     run_llm = True
@@ -14172,9 +14179,9 @@ class BeamMemory:
                     confirmed = is_conflict
                 if not confirmed:
                     continue
-                # Track chained pairs in BOTH dry-run and apply so a dry run
-                # reports exactly what an apply would do. A dry run only
-                # simulates the supersession (it never calls invalidate()).
+                # Track chained pairs in both modes using the same simulation
+                # rules. A preview never calls invalidate(); a later apply may
+                # observe different state or validation responses.
                 mutated = dry_run
                 if not dry_run and self.invalidate(older_id, replacement_id=newer_id):
                     invalidated += 1
