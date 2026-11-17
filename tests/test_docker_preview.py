@@ -83,7 +83,9 @@ def test_manual_fork_only_and_two_publish_opt_ins():
     native = w['jobs']['build-and-test']
     publish = w['jobs']['publish']
     assert native['if'] == "github.repository == 'dplush/mnemosyne'"
-    assert publish['needs'] == 'build-and-test'
+    assert publish['needs'] == ['resolve', 'build-and-test']
+    assert native['needs'] == 'resolve'
+    assert w['on']['workflow_dispatch']['inputs']['source_tag']['default'] == ''
     assert publish['if'] == ("github.repository == 'dplush/mnemosyne' && inputs.publish && "
                              "vars.MNEMOSYNE_DOCKERHUB_PREVIEW_ENABLED == 'true'")
     assert publish['environment'] == 'dockerhub-preview'
@@ -106,8 +108,9 @@ def test_manual_fork_only_and_two_publish_opt_ins():
     assert upload_index > test_index
 
 
+@pytest.mark.parametrize('source_tag', ['', 'v4.0.0'])
 @pytest.mark.parametrize('failure', [None, 'missing-arm', 'wrong-revision'])
-def test_actual_prelogin_script_validates_both_artifacts(tmp_path, failure):
+def test_actual_prelogin_script_validates_both_artifacts(tmp_path, failure, source_tag):
     """Run the workflow's shell gate with fixture images, never a real registry."""
     w = workflow()
     step = next(s for s in w['jobs']['publish']['steps'] if s.get('name') == 'Validate both tested artifacts before login')
@@ -118,6 +121,12 @@ def test_actual_prelogin_script_validates_both_artifacts(tmp_path, failure):
         path.mkdir(parents=True)
         (path / 'image.tar').write_text('fixture archive')
     infos = {arch: image_info(arch) for arch in ('amd64', 'arm64')}
+    if source_tag:
+        for info in infos.values():
+            info['Config']['Labels'].update({
+                'org.opencontainers.image.source': 'https://github.com/mnemosyne-oss/mnemosyne',
+                'org.opencontainers.image.version': '4.0.0',
+                'io.mnemosyne.community.recipe.revision': 'b' * 40})
     if failure == 'wrong-revision':
         infos['arm64']['Config']['Labels']['org.opencontainers.image.revision'] = 'b' * 40
     (tmp_path / 'infos.json').write_text(json.dumps(infos))
@@ -137,13 +146,13 @@ else:
 ''')
     docker.chmod(0o755)
     env = dict(os.environ, PATH=str(fake_bin) + os.pathsep + str(Path(sys.executable).parent) + os.pathsep + os.environ['PATH'],
-               PREVIEW_SHA=SHA, GITHUB_REPOSITORY='dplush/mnemosyne', DOCKERHUB_USERNAME='ddplush',
+               PREVIEW_SHA=SHA, SOURCE_TAG=source_tag, RECIPE_SHA='b' * 40, GITHUB_REPOSITORY='dplush/mnemosyne', DOCKERHUB_USERNAME='ddplush',
                RUNNER_TEMP=str(tmp_path), GITHUB_ENV=str(tmp_path / 'github-env'), FIXTURE_IMAGES=str(tmp_path / 'infos.json'))
     result = subprocess.run(['bash', '-eo', 'pipefail', '-c', step['run']], cwd=ROOT, env=env,
                             capture_output=True, text=True, timeout=15)
     assert (result.returncode == 0) == (failure is None), result.stdout + result.stderr
     if failure is None:
-        assert 'PREVIEW_TAG=preview-sha-' + SHA in (tmp_path / 'github-env').read_text()
+        assert 'PREVIEW_TAG=' + ('4.0.0' if source_tag else 'preview-sha-' + SHA) in (tmp_path / 'github-env').read_text()
 
 
 def test_verify_cli_rejects_multiple_images(tmp_path):
@@ -196,3 +205,46 @@ if args[:2]==['image','inspect']:
         assert [c for c in calls if c[0] == 'push'] == [
             ['push', 'ddplush/mnemosyne-mcp:preview-sha-' + SHA + '-amd64'],
             ['push', 'ddplush/mnemosyne-mcp:preview-sha-' + SHA + '-arm64']]
+
+
+def test_tagged_metadata_records_upstream_and_recipe():
+    meta = preview.metadata(preview.FORK, SHA, 'ddplush', 'v4.0.0', 'b' * 40)
+    assert meta['tag'] == '4.0.0'
+    assert meta['source'] == 'https://github.com/mnemosyne-oss/mnemosyne'
+    assert meta['recipe_sha'] == 'b' * 40
+    info = image_info()
+    info['Config']['Labels'].update({
+        'org.opencontainers.image.source': meta['source'],
+        'org.opencontainers.image.version': '4.0.0',
+        'io.mnemosyne.community.recipe.revision': 'b' * 40,
+    })
+    preview.verify_image(info, meta, 'amd64')
+    for label in ('org.opencontainers.image.version', 'io.mnemosyne.community.recipe.revision'):
+        broken = copy.deepcopy(info)
+        broken['Config']['Labels'][label] = 'wrong'
+        with pytest.raises(ValueError):
+            preview.verify_image(broken, meta, 'amd64')
+
+
+@pytest.mark.parametrize('tag,recipe', [('main', 'b' * 40), ('v4.0.0', ''), ('v4.0.0', 'b' * 7)])
+def test_release_metadata_rejects_invalid_identity(tag, recipe):
+    with pytest.raises(ValueError):
+        preview.metadata(preview.FORK, SHA, 'ddplush', tag, recipe)
+
+
+def test_release_source_is_resolved_once_and_shared_with_native_jobs():
+    w = workflow()
+    resolve = w['jobs']['resolve']
+    native = w['jobs']['build-and-test']
+    publish = w['jobs']['publish']
+    assert resolve['if'] == "github.repository == 'dplush/mnemosyne'"
+    assert w['env']['SOURCE_TAG'] == '${{ inputs.source_tag }}'
+    assert w['env']['RECIPE_SHA'] == '${{ github.sha }}'
+    for job in (native, publish):
+        assert job['env']['PREVIEW_SHA'] == '${{ needs.resolve.outputs.sha }}'
+    assert native['env']['MNEMOSYNE_TEST_IMAGE_VERSION'] == '${{ needs.resolve.outputs.version }}'
+    build = next(s for s in native['steps'] if s.get('name') == 'Build native source image')['run']
+    assert 'version.py prepare --sha "$PREVIEW_SHA"' in build
+    assert '--context "$CONTEXT"' in build
+    assert '-t "mnemosyne-mcp:preview-$ARCH" "$CONTEXT"' in build
+    assert 'io.mnemosyne.community.recipe.revision=$RECIPE_SHA' in build

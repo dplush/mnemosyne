@@ -6,7 +6,7 @@ This optional workflow is for `dplush/mnemosyne` and publishes community preview
 
 `Docker Hub preview (manual)` only responds to `workflow_dispatch`. Its default `publish=false` builds and runs the existing MCP and full Docker deployment acceptance on native Linux AMD64 and ARM64 runners. It needs no Docker Hub token in this mode and does not upload images or image artifacts. Model downloads, runtime inference, persistence, authentication, backup/restore and Caddy HTTPS are part of the existing suite.
 
-The source is the selected workflow ref resolved by GitHub to the full `github.sha`. Both jobs explicitly check out that SHA. The selected ref must contain the Docker deployment and preview workflow/helpers/tests. There is no arbitrary repository or release-tag input. The workflow is skipped in the upstream repository and all repositories other than the named personal fork.
+With `source_tag` empty, the source is the selected workflow ref resolved by GitHub to the full `github.sha`. With a stable tag such as `v4.0.0`, a resolver fetches that tag only from `mnemosyne-oss/mnemosyne`, dereferences annotated tags and verifies the package version. Both architecture jobs then fetch the same resolved commit SHA. The selected workflow ref supplies the maintained Docker recipe, dependency constraints, helpers and acceptance tests; the release supplies the unchanged package and packaging files. There is no arbitrary source repository input. The workflow is skipped in the upstream repository and all repositories other than the named personal fork.
 
 ## Prepare the fork
 
@@ -20,7 +20,14 @@ A future tests-only dispatch can use:
 gh workflow run docker-preview.yml --repo dplush/mnemosyne --ref YOUR_REVIEWED_BRANCH -f publish=false
 ```
 
-This command starts builds and tests; it is an operator instruction, not a step executed during preparation. No workflow run has been started as part of this change.
+To test a tagged upstream version using the recipe on your reviewed fork branch:
+
+```bash
+gh workflow run docker-preview.yml --repo dplush/mnemosyne --ref YOUR_REVIEWED_BRANCH \
+  -f source_tag=v4.0.0 -f publish=false
+```
+
+Keep `--ref` on the branch containing the new workflow, not the old upstream tag. `source_tag` selects the release code separately. Stable `vMAJOR.MINOR.PATCH` tags are supported; a missing tag or a tag/package version mismatch fails before building. The old release's Dockerfile is deliberately not used: it can install an unpinned PyPI version instead of the tagged code. A release that cannot pass the current deployment acceptance is not published or silently patched.
 
 ## Publication setup for a later, separately authorized step
 
@@ -42,12 +49,14 @@ ddplush/mnemosyne-mcp:preview-sha-<sha>-amd64
 ddplush/mnemosyne-mcp:preview-sha-<sha>-arm64
 ```
 
-There is no `latest`, version/release tag, automatic push trigger or automatic tag trigger. Image source/revision labels identify the fork and commit; the description labels the build as an unofficial community preview. The run summary records the final manifest inspection.
+When `source_tag=v4.0.0`, a separately authorized publishing run instead targets `4.0.0`, `4.0.0-amd64` and `4.0.0-arm64` in the same personal Docker Hub repository. These remain unofficial community images, not upstream releases. There is no `latest`, automatic push trigger or automatic tag trigger.
 
-Commit tags identify source but do not make Docker Hub tags immutable. Re-running the same commit may replace its preview tags. Pin `ddplush/mnemosyne-mcp@sha256:...` for an immutable image selection. A failed publishing run can leave an architecture-specific tag behind before the combined manifest is created; success requires the final manifest step as well as both native tests.
+Image source/revision labels identify the actual source repository and commit. `org.opencontainers.image.version` and the installed wheel must match the selected release version. `io.mnemosyne.community.recipe.revision` separately records the fork commit supplying the Docker recipe. Pre-login checks verify both release and recipe identity. The run summary records source/recipe commits and the final manifest inspection.
+
+Commit tags identify source but do not make Docker Hub tags immutable. Re-running the same source may replace its preview or version tags, including when the recipe changes. Pin `ddplush/mnemosyne-mcp@sha256:...` for an immutable image selection. A failed publishing run can leave an architecture-specific tag behind before the combined manifest is created; success requires the final manifest step as well as both native tests.
 
 ## Verification of this preparation
 
-Offline tests exercise metadata/target validation, platform/source checks, pushed-digest selection, workflow gates and the actual pre-login shell gate with fixture images. Actionlint validates the workflow syntax. These tests do not replace a native workflow run: this preparation does not execute GitHub Actions, start real containers, authenticate to Docker Hub or publish images.
+Offline tests exercise lightweight/annotated tag resolution using local Git repositories, package-version checks, isolated context assembly, metadata/target validation, platform/source/recipe checks, pushed-digest selection, workflow gates and the actual pre-login shell gate with fixture images. Actionlint validates the workflow syntax. These tests do not replace a native workflow run. A `publish=false` dispatch builds and tests containers but does not authenticate to Docker Hub or publish images.
 
 References: [Docker Hub authentication with GitHub Actions](https://docs.docker.com/build/ci/github-actions/), [passing single-platform images between jobs](https://docs.docker.com/build/ci/github-actions/share-image-jobs/).

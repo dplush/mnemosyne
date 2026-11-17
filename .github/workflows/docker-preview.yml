@@ -3,6 +3,11 @@ name: Docker Hub preview (manual)
 on:
   workflow_dispatch:
     inputs:
+      source_tag:
+        description: 'Optional stable upstream tag (e.g. v4.0.0); empty builds the workflow commit'
+        required: false
+        type: string
+        default: ''
       publish:
         description: Publish tested preview images (requires repository activation)
         required: true
@@ -15,9 +20,44 @@ concurrency:
   cancel-in-progress: false
 env:
   DOCKERHUB_USERNAME: ddplush
-  PREVIEW_SHA: ${{ github.sha }}
+  RECIPE_SHA: ${{ github.sha }}
+  SOURCE_TAG: ${{ inputs.source_tag }}
 jobs:
+  resolve:
+    if: github.repository == 'dplush/mnemosyne'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - name: Resolve upstream tag to immutable source
+        id: source
+        run: |
+          python - <<'PYCODE'
+          import json, os, subprocess, sys
+          meta = {'sha': os.environ['RECIPE_SHA'], 'version': ''}
+          if os.environ['SOURCE_TAG']:
+              result = subprocess.check_output([sys.executable, 'deploy/docker/version.py', 'resolve',
+                  '--tag', os.environ['SOURCE_TAG'], '--checkout', os.environ['RUNNER_TEMP'] + '/upstream'], text=True)
+              meta = json.loads(result)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('sha=' + meta['sha'] + '\nversion=' + meta['version'] + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Source: ' + meta['sha'] + '\n\nRecipe: ' + os.environ['RECIPE_SHA'] + '\n')
+          PYCODE
   build-and-test:
+    needs: resolve
+    env:
+      PREVIEW_SHA: ${{ needs.resolve.outputs.sha }}
+      MNEMOSYNE_TEST_IMAGE_VERSION: ${{ needs.resolve.outputs.version }}
     if: github.repository == 'dplush/mnemosyne'
     strategy:
       fail-fast: false
@@ -39,7 +79,7 @@ jobs:
           python-version: '3.11'
       - name: Validate dispatched source
         run: |
-          test "$(git rev-parse HEAD)" = "$PREVIEW_SHA"
+          test "$(git rev-parse HEAD)" = "$RECIPE_SHA"
           python deploy/docker/preview.py metadata --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME"
       - name: Install test tools
         run: pip install -e '.[test,mcp]' -c deploy/docker/requirements.lock
@@ -47,15 +87,25 @@ jobs:
         env:
           ARCH: ${{ matrix.architecture }}
         run: |
+          CONTEXT=.
           VERSION=$(python -c 'from importlib.metadata import version; print(version("mnemosyne-memory"))')
+          SOURCE_URL="https://github.com/$GITHUB_REPOSITORY"
+          if [ -n "$SOURCE_TAG" ]; then
+            VERSION="$MNEMOSYNE_TEST_IMAGE_VERSION"
+            SOURCE_URL=https://github.com/mnemosyne-oss/mnemosyne
+            CONTEXT="$RUNNER_TEMP/build-context"
+            python deploy/docker/version.py prepare --sha "$PREVIEW_SHA" --version "$VERSION" \
+              --checkout "$RUNNER_TEMP/upstream" --recipe "$GITHUB_WORKSPACE" --context "$CONTEXT"
+          fi
           docker build --build-arg VERSION="$VERSION" --build-arg REVISION="$PREVIEW_SHA" \
-            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            --label "org.opencontainers.image.description=Unofficial community preview from $GITHUB_REPOSITORY" \
-            -t "mnemosyne-mcp:preview-$ARCH" .
+            --label "org.opencontainers.image.source=$SOURCE_URL" \
+            --label "io.mnemosyne.community.recipe.revision=$RECIPE_SHA" \
+            --label "org.opencontainers.image.description=Unofficial community image built by $GITHUB_REPOSITORY" \
+            -t "mnemosyne-mcp:preview-$ARCH" "$CONTEXT"
           docker image inspect "mnemosyne-mcp:preview-$ARCH" > "$RUNNER_TEMP/inspect.json"
           python deploy/docker/preview.py verify --repository "$GITHUB_REPOSITORY" --sha "$PREVIEW_SHA" --username "$DOCKERHUB_USERNAME" --architecture "$ARCH" --inspect-file "$RUNNER_TEMP/inspect.json"
       - name: Verify MCP and preview gates
-        run: python -m pytest tests/test_docker_shared_mcp.py tests/test_docker_release.py tests/test_docker_acceptance_gates.py tests/test_docker_preview.py tests/test_mcp_streamable_http.py tests/test_multi_agent_identity.py tests/test_s1_mcp_sse_auth.py -q
+        run: python -m pytest tests/test_docker_shared_mcp.py tests/test_docker_release.py tests/test_docker_acceptance_gates.py tests/test_docker_preview.py tests/test_docker_version.py tests/test_mcp_streamable_http.py tests/test_multi_agent_identity.py tests/test_s1_mcp_sse_auth.py -q
       - name: Verify native deployment
         env:
           ARCH: ${{ matrix.architecture }}
@@ -68,13 +118,15 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: inputs.publish && vars.MNEMOSYNE_DOCKERHUB_PREVIEW_ENABLED == 'true'
         with:
-          name: preview-${{ github.sha }}-${{ matrix.architecture }}
+          name: preview-${{ needs.resolve.outputs.sha }}-${{ matrix.architecture }}
           path: ${{ runner.temp }}/image.tar
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
   publish:
-    needs: build-and-test
+    needs: [resolve, build-and-test]
+    env:
+      PREVIEW_SHA: ${{ needs.resolve.outputs.sha }}
     if: github.repository == 'dplush/mnemosyne' && inputs.publish && vars.MNEMOSYNE_DOCKERHUB_PREVIEW_ENABLED == 'true'
     environment: dockerhub-preview
     runs-on: ubuntu-24.04
@@ -89,7 +141,7 @@ jobs:
           python-version: '3.11'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: preview-${{ github.sha }}-*
+          pattern: preview-${{ needs.resolve.outputs.sha }}-*
           path: ${{ runner.temp }}/tested-images
       - name: Validate both tested artifacts before login
         run: |

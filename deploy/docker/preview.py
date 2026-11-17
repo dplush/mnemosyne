@@ -1,19 +1,28 @@
 """Validate fork preview metadata and tested images without registry access."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 
 FORK = 'dplush/mnemosyne'
 
 
-def metadata(repository, sha, username):
+def metadata(repository, sha, username, source_tag="", recipe_sha=""):
     if repository != FORK:
         raise ValueError('Preview builds are restricted to ' + FORK)
     if not re.fullmatch(r'[0-9a-f]{40}', sha):
         raise ValueError('Expected a full lowercase Git commit SHA')
     if not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', username):
         raise ValueError('Expected a Docker Hub username, without a registry or path')
+    if source_tag:
+        if not re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', source_tag):
+            raise ValueError('Expected a stable upstream version tag')
+        if not re.fullmatch(r'[0-9a-f]{40}', recipe_sha):
+            raise ValueError('Expected full recipe commit')
+        return {'image': username + '/mnemosyne-mcp', 'tag': source_tag[1:],
+                'sha': sha, 'source': 'https://github.com/mnemosyne-oss/mnemosyne',
+                'recipe_sha': recipe_sha, 'version': source_tag[1:]}
     return {'image': username + '/mnemosyne-mcp', 'tag': 'preview-sha-' + sha,
             'sha': sha, 'source': 'https://github.com/' + repository}
 
@@ -27,7 +36,12 @@ def verify_image(info, expected, architecture):
     if labels.get('org.opencontainers.image.revision') != expected['sha']:
         raise ValueError('Image revision does not match the dispatched source')
     if labels.get('org.opencontainers.image.source') != expected['source']:
-        raise ValueError('Image source does not match the fork')
+        raise ValueError('Image source does not match the selected repository')
+    if 'version' in expected:
+        if labels.get('org.opencontainers.image.version') != expected['version']:
+            raise ValueError('Image version does not match the upstream tag')
+        if labels.get('io.mnemosyne.community.recipe.revision') != expected['recipe_sha']:
+            raise ValueError('Image recipe does not match the tested workflow commit')
 
 
 def pushed_digest(info, image):
@@ -44,11 +58,13 @@ def main():
     parser.add_argument('--repository', required=True)
     parser.add_argument('--sha', required=True)
     parser.add_argument('--username', required=True)
+    parser.add_argument('--source-tag', default=os.environ.get('SOURCE_TAG', ''))
+    parser.add_argument('--recipe-sha', default=os.environ.get('RECIPE_SHA', ''))
     parser.add_argument('--architecture')
     parser.add_argument('--inspect-file', type=Path)
     args = parser.parse_args()
     try:
-        expected = metadata(args.repository, args.sha, args.username)
+        expected = metadata(args.repository, args.sha, args.username, args.source_tag, args.recipe_sha)
         if args.operation == 'metadata':
             print(json.dumps(expected))
         else:

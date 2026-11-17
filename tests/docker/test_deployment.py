@@ -192,7 +192,7 @@ def test_documented_restore_override_is_isolated(compose_cmd,tmp_path):
 
 def test_image_nonroot_version_and_volumes(image):
     assert docker('run','--rm','--entrypoint','id',image,'-u') == '10001'
-    expected = __import__('mnemosyne').__version__
+    expected = os.environ.get('MNEMOSYNE_TEST_IMAGE_VERSION') or __import__('mnemosyne').__version__
     assert docker('run','--rm','--entrypoint','python',image,'-c','from importlib.metadata import version; print(version("mnemosyne-memory"))') == expected
     with volume() as data, volume() as cache:
         docker('run','--rm','-v',data+':/data','-v',cache+':/cache','--entrypoint','python',image,'-c',
